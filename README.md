@@ -31,13 +31,22 @@ git clone https://github.com/asfilion/beat-weaver.git
 cd beat-weaver
 
 # Core (data pipeline only)
-pip install -e .
+uv sync
 
 # With ML model dependencies (required for training and generation)
-pip install -e ".[ml]"
+uv sync --extra ml
 
-# Development (adds pytest)
-pip install -e ".[ml,dev]"
+# Development (adds pytest and coverage tools)
+uv sync --extra ml --group dev
+```
+
+The ML install path is CUDA-first and resolves `torch` and `torchaudio` from the official PyTorch
+CUDA 13.0 wheel index via `uv`. This is intended for NVIDIA systems with a new enough driver.
+
+Verify the installation:
+
+```bash
+uv run python -c "import torch, torchaudio; print(torch.__version__); print(torch.version.cuda); print(torch.cuda.is_available())"
 ```
 
 ## Quick Start: Training a Model
@@ -199,7 +208,7 @@ See [RESEARCH.md](RESEARCH.md) for research details and [plans/](plans/) for imp
 
 ```bash
 # Run all tests (178 total; ML tests auto-skip without ML deps)
-python -m pytest tests/ -v
+uv run pytest tests/ -v
 ```
 
 ## License
