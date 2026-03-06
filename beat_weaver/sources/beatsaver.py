@@ -8,12 +8,16 @@ from pathlib import Path
 from typing import Iterator
 
 import requests
+from requests import Response
 
 BASE_URL = "https://api.beatsaver.com"
 DEFAULT_MIN_SCORE = 0.75
 DEFAULT_MIN_UPVOTES = 5
 DEFAULT_PAGE_SIZE = 20
 REQUEST_DELAY = 1.0  # seconds between API requests
+MAX_RETRIES = 5
+BACKOFF_BASE_DELAY = 5.0  # seconds
+BACKOFF_MAX_DELAY = 120.0  # seconds
 
 logger = logging.getLogger(__name__)
 
@@ -22,6 +26,71 @@ class BeatSaverClient:
     def __init__(self):
         self.session = requests.Session()
         self.session.headers["User-Agent"] = "BeatWeaver/0.1.0"
+
+    def _compute_retry_delay(self, response: Response | None, attempt: int) -> float:
+        if response is not None:
+            retry_after = response.headers.get("Retry-After")
+            if retry_after:
+                try:
+                    return min(float(retry_after), BACKOFF_MAX_DELAY)
+                except ValueError:
+                    logger.debug("Ignoring non-numeric Retry-After header: %s", retry_after)
+        return min(BACKOFF_BASE_DELAY * (2 ** max(attempt - 1, 0)), BACKOFF_MAX_DELAY)
+
+    def _get_json_with_retry(self, path: str, params: dict | None = None) -> dict:
+        last_error: requests.HTTPError | None = None
+
+        for attempt in range(1, MAX_RETRIES + 1):
+            response = self.session.get(f"{BASE_URL}{path}", params=params)
+
+            if response.status_code != 429:
+                response.raise_for_status()
+                return response.json()
+
+            delay = self._compute_retry_delay(response, attempt)
+            logger.warning(
+                "BeatSaver rate limited request to %s (attempt %d/%d). Retrying in %.1fs",
+                path, attempt, MAX_RETRIES, delay,
+            )
+            last_error = requests.HTTPError(
+                f"429 Client Error: Too Many Requests for url: {response.url}",
+                response=response,
+            )
+
+            if attempt < MAX_RETRIES:
+                time.sleep(delay)
+
+        assert last_error is not None
+        raise last_error
+
+    def _download_bytes_with_retry(self, url: str) -> bytes:
+        last_error: requests.HTTPError | None = None
+
+        for attempt in range(1, MAX_RETRIES + 1):
+            response = requests.get(
+                url,
+                headers={"User-Agent": "BeatWeaver/0.1.0"},
+            )
+
+            if response.status_code != 429:
+                response.raise_for_status()
+                return response.content
+
+            delay = self._compute_retry_delay(response, attempt)
+            logger.warning(
+                "BeatSaver rate limited download %s (attempt %d/%d). Retrying in %.1fs",
+                url, attempt, MAX_RETRIES, delay,
+            )
+            last_error = requests.HTTPError(
+                f"429 Client Error: Too Many Requests for url: {response.url}",
+                response=response,
+            )
+
+            if attempt < MAX_RETRIES:
+                time.sleep(delay)
+
+        assert last_error is not None
+        raise last_error
 
     def search_maps(
         self,
@@ -40,12 +109,10 @@ class BeatSaverClient:
         page = 0
 
         while page < max_pages:
-            response = self.session.get(
-                f"{BASE_URL}/search/text/{page}",
+            data = self._get_json_with_retry(
+                f"/search/text/{page}",
                 params={"sortOrder": "Rating"},
             )
-            response.raise_for_status()
-            data = response.json()
 
             below_threshold = 0
             for doc in data.get("docs", []):
@@ -102,13 +169,9 @@ class BeatSaverClient:
             if download_url.startswith("/"):
                 download_url = f"https://beatsaver.com{download_url}"
 
-            response = requests.get(
-                download_url,
-                headers={"User-Agent": "BeatWeaver/0.1.0"},
-            )
-            response.raise_for_status()
+            content = self._download_bytes_with_retry(download_url)
 
-            with zipfile.ZipFile(io.BytesIO(response.content)) as zf:
+            with zipfile.ZipFile(io.BytesIO(content)) as zf:
                 zf.extractall(target_dir)
 
             meta_path = target_dir / "_beatsaver_meta.json"
