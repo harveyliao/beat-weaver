@@ -4,8 +4,11 @@ from __future__ import annotations
 
 import json
 import logging
+import statistics
 import sys
 import time
+from contextlib import nullcontext
+from dataclasses import dataclass
 from pathlib import Path
 
 import torch
@@ -19,6 +22,19 @@ from beat_weaver.model.tokenizer import LEFT_BASE, LEFT_COUNT, PAD, RIGHT_BASE, 
 from beat_weaver.model.transformer import BeatWeaverModel
 
 logger = logging.getLogger(__name__)
+
+
+@dataclass
+class TrainDebugOptions:
+    """Optional knobs for short-run profiling and benchmarking."""
+
+    max_steps: int | None = None
+    profile: bool = False
+    profile_wait: int = 5
+    profile_warmup: int = 5
+    profile_active: int = 10
+    profile_log_interval: int = 20
+    skip_validation: bool = False
 
 
 def _get_device() -> torch.device:
@@ -52,16 +68,56 @@ def _color_balance_loss(logits: torch.Tensor) -> torch.Tensor:
 
     Only considers positions where a note token (LEFT or RIGHT) is likely.
     """
-    probs = torch.softmax(logits, dim=-1)  # (batch, seq, vocab)
-    left_prob = probs[:, :, LEFT_BASE : LEFT_BASE + LEFT_COUNT].sum(dim=-1)
-    right_prob = probs[:, :, RIGHT_BASE : RIGHT_BASE + RIGHT_COUNT].sum(dim=-1)
-    total = left_prob + right_prob + 1e-8
-    # Only count positions where note tokens have meaningful probability
-    note_mask = total > 0.1
-    if not note_mask.any():
-        return torch.tensor(0.0, device=logits.device)
-    left_ratio = left_prob[note_mask] / total[note_mask]
-    return ((left_ratio - 0.5) ** 2).mean()
+    logits_fp32 = logits.float()
+    left_logits = logits_fp32[:, :, LEFT_BASE : LEFT_BASE + LEFT_COUNT]
+    right_logits = logits_fp32[:, :, RIGHT_BASE : RIGHT_BASE + RIGHT_COUNT]
+
+    left_log_mass = torch.logsumexp(left_logits, dim=-1)
+    right_log_mass = torch.logsumexp(right_logits, dim=-1)
+    note_log_mass = torch.logaddexp(left_log_mass, right_log_mass)
+    total_log_mass = torch.logsumexp(logits_fp32, dim=-1)
+
+    # Soft mask instead of boolean indexing to avoid extra CUDA gather/sync work.
+    note_weight = (note_log_mass - total_log_mass).exp()
+    active_weight = torch.where(note_weight > 0.1, note_weight, torch.zeros_like(note_weight))
+    denom = active_weight.sum()
+    if denom.item() == 0:
+        return logits_fp32.new_zeros(())
+
+    left_ratio = (left_log_mass - note_log_mass).exp()
+    imbalance = (left_ratio - 0.5).square()
+    return (imbalance * active_weight).sum() / denom
+
+
+def _sync_cuda(device: torch.device) -> None:
+    if device.type == "cuda":
+        torch.cuda.synchronize(device)
+
+
+def _summarize_phase_times(samples: dict[str, list[float]]) -> dict[str, dict[str, float]]:
+    summary: dict[str, dict[str, float]] = {}
+    for name, values in samples.items():
+        if not values:
+            continue
+        ordered = sorted(values)
+        summary[name] = {
+            "mean_ms": round(statistics.fmean(values) * 1000, 3),
+            "p50_ms": round(statistics.median(values) * 1000, 3),
+            "p95_ms": round(ordered[min(len(ordered) - 1, int(len(ordered) * 0.95))] * 1000, 3),
+            "max_ms": round(max(values) * 1000, 3),
+        }
+    return summary
+
+
+def _log_phase_summary(summary: dict[str, dict[str, float]], steps: int) -> None:
+    if not summary:
+        return
+    parts = []
+    for phase, stats in summary.items():
+        parts.append(
+            f"{phase}=mean {stats['mean_ms']:.1f}ms p95 {stats['p95_ms']:.1f}ms max {stats['max_ms']:.1f}ms"
+        )
+    logger.info("Step timing summary over %d steps: %s", steps, "; ".join(parts))
 
 
 class Trainer:
@@ -98,26 +154,56 @@ class Trainer:
         self.best_val_loss = float("inf")
         self.patience_counter = 0
 
-    def train_epoch(self, dataloader: DataLoader) -> float:
-        """Run one training epoch. Returns average loss."""
+    def train_epoch(
+        self,
+        dataloader: DataLoader,
+        *,
+        max_steps: int | None = None,
+        profile_log_interval: int = 50,
+        profiler: torch.profiler.profile | None = None,
+    ) -> tuple[float, int, dict[str, dict[str, float]]]:
+        """Run one training epoch. Returns average loss, steps run, and timing summary."""
         self.model.train()
         total_loss = 0.0
         n_batches = 0
         accum_steps = self.config.gradient_accumulation_steps
+        phase_times = {
+            "batch_fetch": [],
+            "host_to_device": [],
+            "forward_loss": [],
+            "backward": [],
+            "optimizer": [],
+            "step_total": [],
+        }
 
         self.optimizer.zero_grad()
+        data_iter = iter(dataloader)
+        batch_idx = 0
+        while True:
+            if max_steps is not None and n_batches >= max_steps:
+                break
+            fetch_started = time.perf_counter()
+            try:
+                mel, mel_mask, tokens, token_mask = next(data_iter)
+            except StopIteration:
+                break
+            phase_times["batch_fetch"].append(time.perf_counter() - fetch_started)
 
-        for batch_idx, (mel, mel_mask, tokens, token_mask) in enumerate(dataloader):
+            step_started = time.perf_counter()
+            transfer_started = time.perf_counter()
             mel = mel.to(self.device)
             mel_mask = mel_mask.to(self.device)
             tokens = tokens.to(self.device)
             token_mask = token_mask.to(self.device)
+            _sync_cuda(self.device)
+            phase_times["host_to_device"].append(time.perf_counter() - transfer_started)
 
             # Teacher forcing: input is tokens[:-1], target is tokens[1:]
             input_tokens = tokens[:, :-1]
             target_tokens = tokens[:, 1:]
             input_mask = token_mask[:, :-1]
 
+            forward_started = time.perf_counter()
             with torch.amp.autocast(device_type=self.device.type, enabled=self.device.type == "cuda"):
                 logits = self.model(mel, input_tokens, mel_mask, input_mask)
                 # logits: (batch, seq_len-1, vocab_size)
@@ -130,10 +216,17 @@ class Trainer:
                 if self.config.color_balance_weight > 0:
                     loss = loss + self.config.color_balance_weight * _color_balance_loss(logits)
                 loss = loss / accum_steps  # Scale for accumulation
+            _sync_cuda(self.device)
+            phase_times["forward_loss"].append(time.perf_counter() - forward_started)
 
+            backward_started = time.perf_counter()
             self.scaler.scale(loss).backward()
+            _sync_cuda(self.device)
+            phase_times["backward"].append(time.perf_counter() - backward_started)
 
+            optimizer_duration = 0.0
             if (batch_idx + 1) % accum_steps == 0 or (batch_idx + 1) == len(dataloader):
+                optimizer_started = time.perf_counter()
                 self.scaler.unscale_(self.optimizer)
                 nn.utils.clip_grad_norm_(
                     self.model.parameters(), self.config.gradient_clip_norm,
@@ -144,19 +237,38 @@ class Trainer:
 
                 if hasattr(self, "scheduler"):
                     self.scheduler.step()
+                _sync_cuda(self.device)
+                optimizer_duration = time.perf_counter() - optimizer_started
+            phase_times["optimizer"].append(optimizer_duration)
 
             total_loss += loss.item() * accum_steps  # Unscale for logging
             n_batches += 1
             self.global_step += 1
+            phase_times["step_total"].append(time.perf_counter() - step_started)
+            if profiler is not None:
+                profiler.step()
 
-            # Log every 50 steps
-            if self.global_step % 50 == 0:
+            # Log every N steps
+            if self.global_step % profile_log_interval == 0:
                 self.writer.add_scalar("train/loss_step", loss.item() * accum_steps, self.global_step)
                 lr = self.optimizer.param_groups[0]["lr"]
                 self.writer.add_scalar("train/lr", lr, self.global_step)
+                if self.device.type == "cuda":
+                    self.writer.add_scalar(
+                        "train/gpu_memory_allocated_mb",
+                        torch.cuda.memory_allocated(self.device) / (1024 * 1024),
+                        self.global_step,
+                    )
+                    self.writer.add_scalar(
+                        "train/gpu_memory_reserved_mb",
+                        torch.cuda.memory_reserved(self.device) / (1024 * 1024),
+                        self.global_step,
+                    )
+
+            batch_idx += 1
 
         avg_loss = total_loss / max(1, n_batches)
-        return avg_loss
+        return avg_loss, n_batches, _summarize_phase_times(phase_times)
 
     @torch.no_grad()
     def validate(self, dataloader: DataLoader) -> dict[str, float]:
@@ -274,6 +386,7 @@ def train(
     val_dataset: BeatSaberDataset,
     output_dir: Path,
     resume_from: Path | None = None,
+    debug: TrainDebugOptions | None = None,
 ) -> Path:
     """Main training entry point.
 
@@ -281,6 +394,7 @@ def train(
     """
     output_dir = Path(output_dir)
     output_dir.mkdir(parents=True, exist_ok=True)
+    debug = debug or TrainDebugOptions()
 
     model = BeatWeaverModel(config)
     logger.info("Model parameters: %s", f"{model.count_parameters():,}")
@@ -334,44 +448,100 @@ def train(
         "Training: %d train samples, %d val samples, %d batches/epoch, device=%s",
         len(train_dataset), len(val_dataset), len(train_loader), trainer.device,
     )
-
-    for epoch in range(trainer.epoch, config.max_epochs):
-        trainer.epoch = epoch
-        t0 = time.time()
-
-        train_loss = trainer.train_epoch(train_loader)
-        val_metrics = trainer.validate(val_loader)
-
-        elapsed = time.time() - t0
-        epoch_times.append(elapsed)
-        total_elapsed = time.time() - training_start
-
+    if debug.max_steps is not None:
         logger.info(
-            "Epoch %d/%d (%.1fs, total %.0fs): train_loss=%.4f val_loss=%.4f val_acc=%.4f",
-            epoch + 1, config.max_epochs, elapsed, total_elapsed,
-            train_loss, val_metrics["val_loss"], val_metrics["val_token_accuracy"],
+            "Short-run mode enabled: max_steps=%d, profile=%s, skip_validation=%s",
+            debug.max_steps, debug.profile, debug.skip_validation,
         )
 
-        # TensorBoard
-        trainer.writer.add_scalar("train/loss_epoch", train_loss, epoch)
-        trainer.writer.add_scalar("val/loss", val_metrics["val_loss"], epoch)
-        trainer.writer.add_scalar("val/token_accuracy", val_metrics["val_token_accuracy"], epoch)
-        trainer.writer.add_scalar("timing/epoch_seconds", elapsed, epoch)
-        trainer.writer.add_scalar("timing/total_seconds", total_elapsed, epoch)
+    profiler_ctx = None
+    if debug.profile:
+        trace_dir = output_dir / "profiling"
+        trace_dir.mkdir(parents=True, exist_ok=True)
+        profiler_ctx = torch.profiler.profile(
+            activities=[
+                torch.profiler.ProfilerActivity.CPU,
+                *( [torch.profiler.ProfilerActivity.CUDA] if trainer.device.type == "cuda" else [] ),
+            ],
+            schedule=torch.profiler.schedule(
+                wait=debug.profile_wait,
+                warmup=debug.profile_warmup,
+                active=debug.profile_active,
+                repeat=1,
+            ),
+            on_trace_ready=torch.profiler.tensorboard_trace_handler(str(trace_dir)),
+            record_shapes=True,
+            profile_memory=True,
+            with_stack=True,
+        )
 
-        # Checkpoint every epoch
-        trainer.save_checkpoint(f"epoch_{epoch + 1:03d}")
+    total_profiled_steps = 0
+    collected_phase_summaries: list[dict[str, dict[str, float]]] = []
 
-        # Best model
-        if val_metrics["val_loss"] < trainer.best_val_loss:
-            trainer.best_val_loss = val_metrics["val_loss"]
-            trainer.patience_counter = 0
-            trainer.save_checkpoint("best")
-            logger.info("New best model (val_loss=%.4f)", trainer.best_val_loss)
-        else:
-            trainer.patience_counter += 1
-            if trainer.patience_counter >= config.early_stopping_patience:
-                logger.info("Early stopping at epoch %d", epoch + 1)
+    with profiler_ctx if profiler_ctx is not None else nullcontext() as maybe_profiler:
+        profiler = maybe_profiler if profiler_ctx is not None else None
+        for epoch in range(trainer.epoch, config.max_epochs):
+            trainer.epoch = epoch
+            t0 = time.time()
+            remaining_steps = None
+            if debug.max_steps is not None:
+                remaining_steps = max(0, debug.max_steps - total_profiled_steps)
+                if remaining_steps == 0:
+                    break
+
+            train_loss, steps_run, phase_summary = trainer.train_epoch(
+                train_loader,
+                max_steps=remaining_steps,
+                profile_log_interval=debug.profile_log_interval,
+                profiler=profiler,
+            )
+            total_profiled_steps += steps_run
+            if phase_summary:
+                collected_phase_summaries.append(phase_summary)
+                _log_phase_summary(phase_summary, steps_run)
+
+            if debug.skip_validation and debug.max_steps is not None:
+                val_metrics = {"val_loss": float("nan"), "val_token_accuracy": float("nan")}
+            else:
+                val_metrics = trainer.validate(val_loader)
+
+            elapsed = time.time() - t0
+            epoch_times.append(elapsed)
+            total_elapsed = time.time() - training_start
+
+            logger.info(
+                "Epoch %d/%d (%.1fs, total %.0fs): train_loss=%.4f val_loss=%.4f val_acc=%.4f",
+                epoch + 1, config.max_epochs, elapsed, total_elapsed,
+                train_loss, val_metrics["val_loss"], val_metrics["val_token_accuracy"],
+            )
+
+            # TensorBoard
+            trainer.writer.add_scalar("train/loss_epoch", train_loss, epoch)
+            trainer.writer.add_scalar("val/loss", val_metrics["val_loss"], epoch)
+            trainer.writer.add_scalar("val/token_accuracy", val_metrics["val_token_accuracy"], epoch)
+            trainer.writer.add_scalar("timing/epoch_seconds", elapsed, epoch)
+            trainer.writer.add_scalar("timing/total_seconds", total_elapsed, epoch)
+
+            # Checkpoint every epoch
+            trainer.save_checkpoint(f"epoch_{epoch + 1:03d}")
+
+            # Best model
+            if debug.skip_validation and debug.max_steps is not None and trainer.best_val_loss == float("inf"):
+                trainer.save_checkpoint("best")
+                logger.info("Saved baseline checkpoint for profiling run without validation")
+            elif val_metrics["val_loss"] < trainer.best_val_loss:
+                trainer.best_val_loss = val_metrics["val_loss"]
+                trainer.patience_counter = 0
+                trainer.save_checkpoint("best")
+                logger.info("New best model (val_loss=%.4f)", trainer.best_val_loss)
+            elif not debug.skip_validation:
+                trainer.patience_counter += 1
+                if trainer.patience_counter >= config.early_stopping_patience:
+                    logger.info("Early stopping at epoch %d", epoch + 1)
+                    break
+
+            if debug.max_steps is not None and total_profiled_steps >= debug.max_steps:
+                logger.info("Reached profiling step limit (%d); stopping training run", debug.max_steps)
                 break
 
     trainer.writer.close()
@@ -380,21 +550,36 @@ def train(
     total_time = time.time() - training_start
     epochs_completed = len(epoch_times)
     avg_epoch = sum(epoch_times) / max(1, epochs_completed)
+    if total_profiled_steps > 0:
+        samples_per_second = round((total_profiled_steps * config.batch_size) / max(total_time, 1e-8), 1)
+    else:
+        samples_per_second = round(len(train_dataset) / avg_epoch, 1)
     summary = {
         "train_samples": len(train_dataset),
         "val_samples": len(val_dataset),
         "batches_per_epoch": len(train_loader),
         "batch_size": config.batch_size,
         "epochs_completed": epochs_completed,
+        "steps_profiled": total_profiled_steps,
         "total_time_seconds": round(total_time, 1),
         "avg_epoch_seconds": round(avg_epoch, 1),
-        "samples_per_second": round(len(train_dataset) / avg_epoch, 1),
+        "samples_per_second": samples_per_second,
         "best_val_loss": round(trainer.best_val_loss, 4),
         "device": str(trainer.device),
         "model_parameters": model.count_parameters(),
     }
     summary_path = output_dir / "training_summary.json"
     summary_path.write_text(json.dumps(summary, indent=2), encoding="utf-8")
+    if collected_phase_summaries:
+        profiling_summary = {
+            "steps_profiled": total_profiled_steps,
+            "profile_enabled": debug.profile,
+            "max_steps": debug.max_steps,
+            "skip_validation": debug.skip_validation,
+            "phase_summaries": collected_phase_summaries,
+        }
+        profiling_summary_path = output_dir / "profiling_summary.json"
+        profiling_summary_path.write_text(json.dumps(profiling_summary, indent=2), encoding="utf-8")
     logger.info(
         "Training complete: %d epochs in %.0fs (avg %.1fs/epoch, %.1f samples/s)",
         epochs_completed, total_time, avg_epoch,
