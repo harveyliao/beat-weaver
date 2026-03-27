@@ -10,3 +10,10 @@ build/
 .pytest_cache/
 .claude/settings.local.json
 resume_training.txt
+.tmp*/
+my_map/
+youtube/
+*.patch
+*.bak
+*.log
+predict.ps1
