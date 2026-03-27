@@ -4,42 +4,52 @@ version = "0.1.0"
 description = "AI-powered Beat Saber track generator"
 requires-python = ">=3.11"
 dependencies = [
-    "requests>=2.31",
-    "UnityPy>=1.10",
-    "pyarrow>=15.0",
-    "tqdm>=4.66",
+  "requests>=2.31",
+  "UnityPy>=1.10",
+  "pyarrow>=15.0",
+  "tqdm>=4.66",
 ]
 
 [project.optional-dependencies]
 ml = [
-    "torch>=2.2",
-    "torchaudio>=2.2",
-    "librosa>=0.10",
-    "pandas>=2.2",
-    "soundfile>=0.12",
-    "tensorboard>=2.16",
+  "torch>=2.2",
+  "torchaudio>=2.2",
+  "librosa>=0.10",
+  "pandas>=2.2",
+  "soundfile>=0.12",
+  "tensorboard>=2.16",
 ]
 
 [dependency-groups]
-dev = [
-    "pytest>=8.0",
-    "pytest-cov>=5.0",
-]
+dev = ["pytest>=8.0", "pytest-cov>=5.0"]
 
 [project.scripts]
 beat-weaver = "beat_weaver.cli:main"
-
-[tool.setuptools.packages.find]
-include = ["beat_weaver*"]
-
-[tool.uv.sources]
-torch = { index = "pytorch-cu130" }
-torchaudio = { index = "pytorch-cu130" }
 
 [[tool.uv.index]]
 name = "pytorch-cu130"
 url = "https://download.pytorch.org/whl/cu130"
 explicit = true
+
+[tool.uv.sources]
+torch = [
+  { index = "pytorch-cu130", marker = "sys_platform == 'linux' or sys_platform == 'win32'" },
+]
+torchaudio = [
+  { index = "pytorch-cu130", marker = "sys_platform == 'linux' or sys_platform == 'win32'" },
+]
+
+[tool.setuptools.packages.find]
+include = ["beat_weaver*"]
+
+# [tool.uv.sources]
+# torch = { index = "pytorch-cu130" }
+# torchaudio = { index = "pytorch-cu130" }
+
+# [[tool.uv.index]]
+# name = "pytorch-cu130"
+# url = "https://download.pytorch.org/whl/cu130"
+# explicit = true
 
 [build-system]
 requires = ["setuptools>=68.0"]
