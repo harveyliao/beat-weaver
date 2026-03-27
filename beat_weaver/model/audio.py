@@ -13,6 +13,7 @@ import librosa
 import numpy as np
 import soundfile as sf
 from scipy.interpolate import interp1d
+from tqdm import tqdm
 
 logger = logging.getLogger(__name__)
 
@@ -184,6 +185,7 @@ def build_audio_manifest(raw_dirs: list[Path]) -> dict[str, str]:
     Falls back to scanning for common audio extensions.
     """
     manifest: dict[str, str] = {}
+    skipped = 0
 
     for raw_dir in raw_dirs:
         raw_dir = Path(raw_dir)
@@ -191,25 +193,31 @@ def build_audio_manifest(raw_dirs: list[Path]) -> dict[str, str]:
             logger.warning("Raw directory not found: %s", raw_dir)
             continue
 
-        for info_file in raw_dir.rglob("Info.dat"):
-            folder = info_file.parent
-            song_hash = _hash_folder(folder)
+        info_files = list(raw_dir.rglob("Info.dat"))
+        info_files.extend(
+            info_file
+            for info_file in raw_dir.rglob("info.dat")
+            if info_file.name != "Info.dat"
+        )
 
-            # Try to find audio file referenced in Info.dat
-            audio_path = _find_audio_in_folder(folder, info_file)
-            if audio_path:
-                manifest[song_hash] = str(audio_path)
+        with tqdm(total=len(info_files), desc="Building manifest") as pbar:
+            for info_file in info_files:
+                folder = info_file.parent
+                song_hash = _hash_folder(folder)
 
-        # Also check for case-insensitive info.dat
-        for info_file in raw_dir.rglob("info.dat"):
-            if info_file.name == "Info.dat":
-                continue  # already handled above
-            folder = info_file.parent
-            song_hash = _hash_folder(folder)
-            if song_hash not in manifest:
+                if song_hash in manifest:
+                    pbar.update(1)
+                    pbar.set_postfix(found=len(manifest), skipped=skipped)
+                    continue
+
                 audio_path = _find_audio_in_folder(folder, info_file)
                 if audio_path:
                     manifest[song_hash] = str(audio_path)
+                else:
+                    skipped += 1
+
+                pbar.update(1)
+                pbar.set_postfix(found=len(manifest), skipped=skipped)
 
     logger.info("Built audio manifest: %d entries", len(manifest))
     return manifest

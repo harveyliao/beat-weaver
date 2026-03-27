@@ -166,6 +166,46 @@ class TestAudioManifest:
         audio_path = list(manifest.values())[0]
         assert Path(audio_path).exists()
 
+    def test_build_supports_lowercase_info_dat(self, tmp_path):
+        map_dir = tmp_path / "raw" / "lowercase_map"
+        map_dir.mkdir(parents=True)
+
+        info = {"_songFilename": "song.ogg", "_songName": "Test", "_beatsPerMinute": 120}
+        (map_dir / "info.dat").write_text(json.dumps(info))
+
+        sr = 22050
+        audio = np.zeros(sr, dtype=np.float32)
+        sf.write(str(map_dir / "song.ogg"), audio, sr)
+
+        manifest = build_audio_manifest([tmp_path / "raw"])
+        assert len(manifest) == 1
+        assert Path(next(iter(manifest.values()))).exists()
+
+    def test_build_skips_folders_without_audio(self, tmp_path):
+        map_dir = tmp_path / "raw" / "missing_audio"
+        map_dir.mkdir(parents=True)
+
+        info = {"_songFilename": "song.ogg", "_songName": "Missing", "_beatsPerMinute": 120}
+        (map_dir / "Info.dat").write_text(json.dumps(info))
+
+        manifest = build_audio_manifest([tmp_path / "raw"])
+        assert manifest == {}
+
+    def test_build_deduplicates_same_folder_hash(self, tmp_path):
+        map_dir = tmp_path / "raw" / "duplicate_case"
+        map_dir.mkdir(parents=True)
+
+        info = {"_songFilename": "song.ogg", "_songName": "Test", "_beatsPerMinute": 120}
+        (map_dir / "Info.dat").write_text(json.dumps(info))
+        (map_dir / "info.dat").write_text(json.dumps(info))
+
+        sr = 22050
+        audio = np.zeros(sr, dtype=np.float32)
+        sf.write(str(map_dir / "song.ogg"), audio, sr)
+
+        manifest = build_audio_manifest([tmp_path / "raw"])
+        assert len(manifest) == 1
+
 
 class TestMelWithOnset:
     def test_shape(self, sine_wave_file):
