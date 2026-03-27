@@ -12,7 +12,13 @@ pa = pytest.importorskip("pyarrow")
 pq = pytest.importorskip("pyarrow.parquet")
 
 from beat_weaver.model.config import ModelConfig
-from beat_weaver.model.dataset import BeatSaberDataset, _cache_version_key
+from beat_weaver.model.dataset import (
+    BeatSaberDataset,
+    _cache_version_key,
+    _split_hashes,
+    build_train_val_datasets,
+    prepare_dataset_corpus,
+)
 
 
 def _make_test_data(tmp_path, notes_data, metadata_list):
@@ -104,6 +110,19 @@ def _make_simple_dataset(tmp_path, difficulties, characteristics, bpms):
     return processed, manifest_path
 
 
+def _make_simple_dataset_without_cache(tmp_path, difficulties, characteristics, bpms, skip_hashes):
+    """Create a dataset and omit mel cache files for the requested hashes."""
+    processed, manifest_path = _make_simple_dataset(
+        tmp_path, difficulties, characteristics, bpms,
+    )
+    cache_dir = processed / "mel_cache"
+    for song_hash in skip_hashes:
+        cache_path = cache_dir / f"{song_hash}_{bpms[0]}.npy"
+        if cache_path.exists():
+            cache_path.unlink()
+    return processed, manifest_path
+
+
 class TestFilterByDifficulty:
     def test_only_expert_and_above(self, tmp_path):
         """Only Expert/ExpertPlus samples when min_difficulty='Expert'."""
@@ -169,6 +188,36 @@ class TestFilterByBpm:
             assert 50.0 <= s["bpm"] <= 300.0
 
 
+class TestFilterByAudioDecode:
+    def test_skips_samples_with_undecodable_audio_when_cache_missing(self, tmp_path, monkeypatch):
+        """Samples without cache are excluded when the source audio cannot be decoded."""
+        all_hashes = [f"hash_{i:04d}" for i in range(12)]
+        bad_hash = _split_hashes(all_hashes, "train")[0]
+        processed, manifest = _make_simple_dataset_without_cache(
+            tmp_path,
+            difficulties=["Expert"] * 12,
+            characteristics=["Standard"] * 12,
+            bpms=[120.0] * 12,
+            skip_hashes={bad_hash},
+        )
+
+        def fake_load_audio(path, sr=22050):
+            if Path(path).name == "bad.wav":
+                raise RuntimeError("decode failed")
+            return np.zeros(sr, dtype=np.float32), sr
+
+        manifest_data = json.loads(Path(manifest).read_text(encoding="utf-8"))
+        manifest_data[bad_hash] = str(tmp_path / "bad.wav")
+        Path(manifest).write_text(json.dumps(manifest_data), encoding="utf-8")
+
+        monkeypatch.setattr("beat_weaver.model.dataset.load_audio", fake_load_audio)
+
+        config = ModelConfig(max_seq_len=64)
+        ds = BeatSaberDataset(processed, manifest, config, split="train")
+
+        assert all(sample["song_hash"] != bad_hash for sample in ds.samples)
+
+
 class TestSpecAugment:
     def test_training_only(self):
         """SpecAugment modifies mel in train split."""
@@ -231,3 +280,65 @@ class TestCacheVersioning:
         assert not (cache_dir / "abc_120.0.npy").exists()
         # VERSION file should exist now
         assert (cache_dir / "VERSION").exists()
+
+
+class TestSharedCorpusBuild:
+    def test_build_train_val_reuses_single_parquet_read(self, tmp_path, monkeypatch):
+        """Train/val helper should prepare corpus once and preserve split contents."""
+        processed, manifest = _make_simple_dataset(
+            tmp_path,
+            difficulties=["Easy", "Hard", "ExpertPlus"] * 4,
+            characteristics=["Standard"] * 12,
+            bpms=[120.0] * 12,
+        )
+        config = ModelConfig(min_difficulty="Easy", max_seq_len=64)
+
+        baseline_train = BeatSaberDataset(processed, manifest, config, split="train")
+        baseline_val = BeatSaberDataset(processed, manifest, config, split="val")
+
+        import beat_weaver.storage.writer as writer
+
+        original = writer.read_notes_parquet
+        calls = 0
+
+        def wrapped(path):
+            nonlocal calls
+            calls += 1
+            return original(path)
+
+        monkeypatch.setattr(writer, "read_notes_parquet", wrapped)
+
+        shared_train, shared_val = build_train_val_datasets(processed, manifest, config)
+
+        assert calls == 1
+        assert len(shared_train.samples) == len(baseline_train.samples)
+        assert len(shared_val.samples) == len(baseline_val.samples)
+        assert [s["song_hash"] for s in shared_train.samples] == [
+            s["song_hash"] for s in baseline_train.samples
+        ]
+        assert [s["song_hash"] for s in shared_val.samples] == [
+            s["song_hash"] for s in baseline_val.samples
+        ]
+
+    def test_prepare_corpus_uses_persistent_cache(self, tmp_path, monkeypatch):
+        """Second shared build should reuse the prepared sample cache on disk."""
+        processed, manifest = _make_simple_dataset(
+            tmp_path,
+            difficulties=["Easy", "Hard", "ExpertPlus"] * 4,
+            characteristics=["Standard"] * 12,
+            bpms=[120.0] * 12,
+        )
+        config = ModelConfig(min_difficulty="Easy", max_seq_len=64)
+
+        first = prepare_dataset_corpus(processed, manifest, config, include_splits=("train", "val"))
+        assert first.samples
+
+        def fail_read(_path):
+            raise AssertionError("expected prepared dataset cache hit")
+
+        monkeypatch.setattr("beat_weaver.storage.writer.read_notes_parquet", fail_read)
+
+        second = prepare_dataset_corpus(processed, manifest, config, include_splits=("train", "val"))
+
+        assert len(second.samples) == len(first.samples)
+        assert second.split_hashes == first.split_hashes
