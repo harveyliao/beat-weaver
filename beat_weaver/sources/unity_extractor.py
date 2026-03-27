@@ -45,23 +45,20 @@ DIFFICULTY_INT_TO_NAME = {
 
 # Default locations within a Steam installation.
 DEFAULT_BEAT_SABER_PATH = Path(
-    r"C:\Program Files (x86)\Steam\steamapps\common\Beat Saber"
+    # r"C:\Program Files (x86)\Steam\steamapps\common\Beat Saber"
+    r"C:\Users\Harve\BSManager\BSInstances\1.40.8",
 )
 BUNDLES_SUBPATH = (
-    Path("Beat Saber_Data")
-    / "StreamingAssets"
-    / "aa"
-    / "StandaloneWindows64"
+    Path("Beat Saber_Data") / "StreamingAssets" / "aa" / "StandaloneWindows64"
 )
-LEVELS_DATA_SUBPATH = (
-    Path("Beat Saber_Data") / "StreamingAssets" / "BeatmapLevelsData"
-)
+LEVELS_DATA_SUBPATH = Path("Beat Saber_Data") / "StreamingAssets" / "BeatmapLevelsData"
 DLC_LEVELS_SUBPATH = Path("DLC") / "Levels"
 
 
 # ---------------------------------------------------------------------------
 # Helpers
 # ---------------------------------------------------------------------------
+
 
 def _get_raw_bytes(script_field: Any) -> bytes:
     """Coerce a UnityPy ``m_Script`` value to plain ``bytes``.
@@ -89,6 +86,7 @@ def _decompress_if_gzip(data: bytes) -> bytes:
 # ---------------------------------------------------------------------------
 # Pack-bundle metadata reader
 # ---------------------------------------------------------------------------
+
 
 def _read_pack_metadata(bundles_dir: Path) -> dict[str, dict]:
     """Scan all ``*_pack_assets_all_*.bundle`` files and return per-level metadata.
@@ -123,7 +121,10 @@ def _read_pack_metadata(bundles_dir: Path) -> dict[str, dict]:
             # Skip non-level MonoBehaviours (pack definitions, promo, products)
             if "BeatmapLevel" not in name:
                 continue
-            if any(k in name for k in ("Pack", "Product", "Leaderboard", "Promo", "Collection")):
+            if any(
+                k in name
+                for k in ("Pack", "Product", "Leaderboard", "Promo", "Collection")
+            ):
                 continue
 
             # Collect per-difficulty info from the preview sets.
@@ -134,11 +135,13 @@ def _read_pack_metadata(bundles_dir: Path) -> dict[str, dict]:
                     diff_name = DIFFICULTY_INT_TO_NAME.get(diff_int)
                     if diff_name is None:
                         continue
-                    diff_list.append({
-                        "difficulty": diff_name,
-                        "njs": entry.get("_noteJumpMovementSpeed", 0.0),
-                        "njo": entry.get("_noteJumpStartBeatOffset", 0.0),
-                    })
+                    diff_list.append(
+                        {
+                            "difficulty": diff_name,
+                            "njs": entry.get("_noteJumpMovementSpeed", 0.0),
+                            "njo": entry.get("_noteJumpStartBeatOffset", 0.0),
+                        }
+                    )
 
             metadata[level_id] = {
                 "pack": pack_name,
@@ -158,6 +161,7 @@ def _read_pack_metadata(bundles_dir: Path) -> dict[str, dict]:
 # ---------------------------------------------------------------------------
 # Level-data bundle reader
 # ---------------------------------------------------------------------------
+
 
 def _extract_level_bundle(
     bundle_path: Path,
@@ -218,11 +222,13 @@ def _extract_level_bundle(
                 continue
 
             _, bm_raw = text_assets[bm_path_id]
-            resolved.append({
-                "characteristic": characteristic,
-                "difficulty": diff_name,
-                "beatmap_bytes": bm_raw,
-            })
+            resolved.append(
+                {
+                    "characteristic": characteristic,
+                    "difficulty": diff_name,
+                    "beatmap_bytes": bm_raw,
+                }
+            )
 
     if not resolved:
         logger.warning("No beatmap data resolved for %s", bundle_path)
@@ -299,7 +305,9 @@ def _extract_level_bundle(
                     audio_out.write_bytes(clip_data)
                     audio_filename = "song.wav"
                     logger.debug(
-                        "Extracted audio: %s (%d bytes)", level_id, len(clip_data),
+                        "Extracted audio: %s (%d bytes)",
+                        level_id,
+                        len(clip_data),
                     )
                     break
             except Exception:
@@ -308,7 +316,12 @@ def _extract_level_bundle(
 
     # Synthesise a v2-style Info.dat so parse_map_folder() can read the folder.
     info = _build_info_dat(
-        level_id, pack_meta, bpm, njs_lookup, beatmap_filenames, audio_filename,
+        level_id,
+        pack_meta,
+        bpm,
+        njs_lookup,
+        beatmap_filenames,
+        audio_filename,
     )
     info_path = out_folder / "Info.dat"
     info_path.write_text(json.dumps(info, indent=2), encoding="utf-8")
@@ -343,7 +356,11 @@ def _build_info_dat(
         entry = {
             "_difficulty": diff,
             "_difficultyRank": {
-                "Easy": 1, "Normal": 3, "Hard": 5, "Expert": 7, "ExpertPlus": 9,
+                "Easy": 1,
+                "Normal": 3,
+                "Hard": 5,
+                "Expert": 7,
+                "ExpertPlus": 9,
             }.get(diff, 0),
             "_beatmapFilename": filename,
             "_noteJumpMovementSpeed": njs,
@@ -353,10 +370,12 @@ def _build_info_dat(
 
     diff_sets = []
     for char, entries in char_groups.items():
-        diff_sets.append({
-            "_beatmapCharacteristicName": char,
-            "_difficultyBeatmaps": entries,
-        })
+        diff_sets.append(
+            {
+                "_beatmapCharacteristicName": char,
+                "_difficultyBeatmaps": entries,
+            }
+        )
 
     return {
         "_version": "2.0.0",
@@ -374,6 +393,7 @@ def _build_info_dat(
 # ---------------------------------------------------------------------------
 # Public API
 # ---------------------------------------------------------------------------
+
 
 def discover_bundles(
     bundles_dir: Path | None = None,
@@ -495,9 +515,14 @@ def extract_official_maps(
         for bundle_path in level_bundles:
             level_id = bundle_path.name
             meta = meta_lookup.get(level_id.lower())
-            futures[executor.submit(
-                _extract_level_bundle, bundle_path, meta, output_dir,
-            )] = level_id
+            futures[
+                executor.submit(
+                    _extract_level_bundle,
+                    bundle_path,
+                    meta,
+                    output_dir,
+                )
+            ] = level_id
 
         for future in as_completed(futures):
             level_id = futures[future]
@@ -513,6 +538,7 @@ def extract_official_maps(
 
     logger.info(
         "Extracted %d / %d level bundles (BeatmapLevelsData + DLC)",
-        len(extracted), len(level_bundles),
+        len(extracted),
+        len(level_bundles),
     )
     return extracted
