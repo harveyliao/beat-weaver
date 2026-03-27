@@ -13,6 +13,12 @@ logger = logging.getLogger(__name__)
 
 # Maximum Parquet file size in bytes before starting a new file.
 MAX_FILE_BYTES: int = 1_000_000_000  # 1 GB
+_PROCESSED_PATTERNS = (
+    "notes_*.parquet",
+    "bombs_*.parquet",
+    "obstacles_*.parquet",
+    "metadata.json",
+)
 
 # --- Arrow schemas -----------------------------------------------------------
 
@@ -64,93 +70,33 @@ OBSTACLES_SCHEMA = pa.schema(
     ]
 )
 
-
-# --- Public API --------------------------------------------------------------
-
-
-def _write_tables_chunked(
-    tables_by_hash: dict[str, pa.Table],
-    output_dir: Path,
-    prefix: str,
-    schema: pa.Schema,
-    max_file_bytes: int = MAX_FILE_BYTES,
-) -> list[Path]:
-    """Write Arrow tables as one-row-group-per-song files, splitting at *max_file_bytes*.
-
-    Each song_hash gets its own row group inside the Parquet file.  When the
-    current file would exceed *max_file_bytes*, a new file is started.
-
-    Returns the list of written file paths.
-    """
-    written: list[Path] = []
-    file_idx = 0
-    writer: pq.ParquetWriter | None = None
-    current_path: Path | None = None
-
-    def _open_writer() -> tuple[pq.ParquetWriter, Path]:
-        nonlocal file_idx
-        p = output_dir / f"{prefix}_{file_idx:04d}.parquet"
-        w = pq.ParquetWriter(p, schema, compression="snappy")
-        file_idx += 1
-        return w, p
-
-    for _hash, table in sorted(tables_by_hash.items()):
-        if table.num_rows == 0:
-            continue
-
-        # Start a new file if none open yet
-        if writer is None:
-            writer, current_path = _open_writer()
-
-        writer.write_table(table)
-
-        # Check if current file exceeds max size
-        assert current_path is not None
-        current_size = current_path.stat().st_size
-        if current_size >= max_file_bytes:
-            writer.close()
-            written.append(current_path)
-            logger.debug("Closed %s (%d bytes)", current_path.name, current_size)
-            writer, current_path = _open_writer()
-
-    # Close the final file
-    if writer is not None:
-        writer.close()
-        assert current_path is not None
-        written.append(current_path)
-
-    return written
+_SCHEMAS = {
+    "notes": NOTES_SCHEMA,
+    "bombs": BOMBS_SCHEMA,
+    "obstacles": OBSTACLES_SCHEMA,
+}
 
 
-def write_parquet(
+def has_processed_output(output_dir: Path) -> bool:
+    """Return True when *output_dir* already contains processed output files."""
+    output_dir = Path(output_dir)
+    if not output_dir.exists():
+        return False
+    return any(any(output_dir.glob(pattern)) for pattern in _PROCESSED_PATTERNS)
+
+
+def _empty_columns(schema: pa.Schema) -> dict[str, list]:
+    return {name: [] for name in schema.names}
+
+
+def _clamp8(values: list[int]) -> list[int]:
+    return [max(-128, min(127, v)) for v in values]
+
+
+def _beatmaps_to_tables(
     beatmaps: list[NormalizedBeatmap],
-    output_dir: Path,
-    max_file_bytes: int = MAX_FILE_BYTES,
-) -> None:
-    """Write a list of normalized beatmaps to Parquet files and JSON metadata.
-
-    Each song_hash gets its own row group so that readers can push down
-    predicates and skip irrelevant data.  When a Parquet file exceeds
-    *max_file_bytes* (default 1 GB), a new numbered file is started.
-
-    Produces inside *output_dir*:
-      - notes_NNNN.parquet  (one or more)
-      - bombs_NNNN.parquet  (one or more)
-      - obstacles_NNNN.parquet  (one or more)
-      - metadata.json
-
-    Parameters
-    ----------
-    beatmaps:
-        Normalized beatmap objects (one per difficulty).
-    output_dir:
-        Directory to write output files into. Created if it doesn't exist.
-    max_file_bytes:
-        Maximum size in bytes per Parquet file before splitting.
-    """
-    output_dir.mkdir(parents=True, exist_ok=True)
-
-    # Accumulate columnar data grouped by song_hash
+) -> tuple[dict[str, dict[str, pa.Table]], dict[str, dict]]:
+    """Convert beatmaps into Arrow tables grouped by song_hash and metadata rows."""
     notes_by_hash: dict[str, dict[str, list]] = {}
     bombs_by_hash: dict[str, dict[str, list]] = {}
     obstacles_by_hash: dict[str, dict[str, list]] = {}
@@ -166,9 +112,8 @@ def write_parquet(
         characteristic = diff.characteristic
         bpm = meta.bpm
 
-        # --- Notes ---
         if song_hash not in notes_by_hash:
-            notes_by_hash[song_hash] = {k: [] for k in NOTES_SCHEMA.names}
+            notes_by_hash[song_hash] = _empty_columns(NOTES_SCHEMA)
         cols = notes_by_hash[song_hash]
         for note in bm.notes:
             cols["song_hash"].append(song_hash)
@@ -184,9 +129,8 @@ def write_parquet(
             cols["cut_direction"].append(note.cut_direction)
             cols["angle_offset"].append(note.angle_offset)
 
-        # --- Bombs ---
         if song_hash not in bombs_by_hash:
-            bombs_by_hash[song_hash] = {k: [] for k in BOMBS_SCHEMA.names}
+            bombs_by_hash[song_hash] = _empty_columns(BOMBS_SCHEMA)
         bcols = bombs_by_hash[song_hash]
         for bomb in bm.bombs:
             bcols["song_hash"].append(song_hash)
@@ -199,9 +143,8 @@ def write_parquet(
             bcols["x"].append(bomb.x)
             bcols["y"].append(bomb.y)
 
-        # --- Obstacles ---
         if song_hash not in obstacles_by_hash:
-            obstacles_by_hash[song_hash] = {k: [] for k in OBSTACLES_SCHEMA.names}
+            obstacles_by_hash[song_hash] = _empty_columns(OBSTACLES_SCHEMA)
         ocols = obstacles_by_hash[song_hash]
         for obs in bm.obstacles:
             ocols["song_hash"].append(song_hash)
@@ -217,7 +160,6 @@ def write_parquet(
             ocols["width"].append(obs.width)
             ocols["height"].append(obs.height)
 
-        # --- Metadata (deduplicated by hash) ---
         if song_hash not in metadata_by_hash:
             metadata_by_hash[song_hash] = {
                 "hash": song_hash,
@@ -240,54 +182,175 @@ def write_parquet(
             }
         )
 
-    # Clamp int8 columns to [-128, 127] to handle mapping-extension maps
-    def _clamp8(values: list[int]) -> list[int]:
-        return [max(-128, min(127, v)) for v in values]
-
     for cols in notes_by_hash.values():
-        for k in ("x", "y", "color", "cut_direction"):
-            cols[k] = _clamp8(cols[k])
-    for bcols in bombs_by_hash.values():
-        for k in ("x", "y"):
-            bcols[k] = _clamp8(bcols[k])
-    for ocols in obstacles_by_hash.values():
-        for k in ("x", "y", "width", "height"):
-            ocols[k] = _clamp8(ocols[k])
+        for key in ("x", "y", "color", "cut_direction"):
+            cols[key] = _clamp8(cols[key])
+    for cols in bombs_by_hash.values():
+        for key in ("x", "y"):
+            cols[key] = _clamp8(cols[key])
+    for cols in obstacles_by_hash.values():
+        for key in ("x", "y", "width", "height"):
+            cols[key] = _clamp8(cols[key])
 
-    # Convert accumulated columns to Arrow tables (one per song_hash)
-    notes_tables = {
-        h: pa.table(cols, schema=NOTES_SCHEMA)
-        for h, cols in notes_by_hash.items()
+    tables_by_prefix = {
+        "notes": {},
+        "bombs": {},
+        "obstacles": {},
     }
-    bombs_tables = {
-        h: pa.table(cols, schema=BOMBS_SCHEMA)
-        for h, cols in bombs_by_hash.items()
-    }
-    obstacles_tables = {
-        h: pa.table(cols, schema=OBSTACLES_SCHEMA)
-        for h, cols in obstacles_by_hash.items()
-    }
+    valid_metadata: dict[str, dict] = {}
 
-    # Write chunked Parquet files (one row group per song, split at max_file_bytes)
-    notes_files = _write_tables_chunked(
-        notes_tables, output_dir, "notes", NOTES_SCHEMA, max_file_bytes,
+    all_hashes = sorted(
+        set(notes_by_hash) | set(bombs_by_hash) | set(obstacles_by_hash) | set(metadata_by_hash)
     )
-    bombs_files = _write_tables_chunked(
-        bombs_tables, output_dir, "bombs", BOMBS_SCHEMA, max_file_bytes,
-    )
-    obstacles_files = _write_tables_chunked(
-        obstacles_tables, output_dir, "obstacles", OBSTACLES_SCHEMA, max_file_bytes,
-    )
+    for song_hash in all_hashes:
+        try:
+            tables_by_prefix["notes"][song_hash] = pa.table(
+                notes_by_hash.get(song_hash, _empty_columns(NOTES_SCHEMA)),
+                schema=NOTES_SCHEMA,
+            )
+            tables_by_prefix["bombs"][song_hash] = pa.table(
+                bombs_by_hash.get(song_hash, _empty_columns(BOMBS_SCHEMA)),
+                schema=BOMBS_SCHEMA,
+            )
+            tables_by_prefix["obstacles"][song_hash] = pa.table(
+                obstacles_by_hash.get(song_hash, _empty_columns(OBSTACLES_SCHEMA)),
+                schema=OBSTACLES_SCHEMA,
+            )
+            if song_hash in metadata_by_hash:
+                valid_metadata[song_hash] = metadata_by_hash[song_hash]
+        except (pa.ArrowInvalid, OverflowError, ValueError, TypeError) as exc:
+            meta = metadata_by_hash.get(song_hash, {})
+            logger.warning(
+                "Skipping malformed song %s (%s): %s",
+                song_hash,
+                meta.get("source_id", "unknown"),
+                exc,
+            )
 
-    logger.info(
-        "Wrote %d notes files, %d bombs files, %d obstacles files to %s",
-        len(notes_files), len(bombs_files), len(obstacles_files), output_dir,
-    )
+    return tables_by_prefix, valid_metadata
 
-    # --- Write metadata JSON ---
-    metadata_list = list(metadata_by_hash.values())
-    with open(output_dir / "metadata.json", "w", encoding="utf-8") as f:
-        json.dump(metadata_list, f, indent=2)
+
+class ParquetWriteSession:
+    """Append beatmaps to numbered Parquet files and finalize metadata once."""
+
+    def __init__(
+        self,
+        output_dir: Path,
+        max_file_bytes: int = MAX_FILE_BYTES,
+        *,
+        allow_existing: bool = False,
+    ) -> None:
+        self.output_dir = Path(output_dir)
+        self.max_file_bytes = max_file_bytes
+        self.output_dir.mkdir(parents=True, exist_ok=True)
+        if not allow_existing and has_processed_output(self.output_dir):
+            raise FileExistsError(
+                f"Processed output already exists in {self.output_dir}. "
+                "Use a new output directory or remove existing parquet/metadata files."
+            )
+
+        self._writers: dict[str, pq.ParquetWriter | None] = {
+            prefix: None for prefix in _SCHEMAS
+        }
+        self._current_paths: dict[str, Path | None] = {
+            prefix: None for prefix in _SCHEMAS
+        }
+        self._file_indices: dict[str, int] = {prefix: 0 for prefix in _SCHEMAS}
+        self._written_files: dict[str, list[Path]] = {prefix: [] for prefix in _SCHEMAS}
+        self._metadata_by_hash: dict[str, dict] = {}
+        self._closed = False
+
+    def _open_writer(self, prefix: str) -> tuple[pq.ParquetWriter, Path]:
+        path = self.output_dir / f"{prefix}_{self._file_indices[prefix]:04d}.parquet"
+        writer = pq.ParquetWriter(path, _SCHEMAS[prefix], compression="snappy")
+        self._file_indices[prefix] += 1
+        return writer, path
+
+    def _close_writer(self, prefix: str) -> None:
+        writer = self._writers[prefix]
+        path = self._current_paths[prefix]
+        if writer is None or path is None:
+            return
+        writer.close()
+        self._written_files[prefix].append(path)
+        self._writers[prefix] = None
+        self._current_paths[prefix] = None
+
+    def _append_tables(self, prefix: str, tables_by_hash: dict[str, pa.Table]) -> None:
+        for _song_hash, table in sorted(tables_by_hash.items()):
+            if table.num_rows == 0:
+                continue
+            if self._writers[prefix] is None:
+                self._writers[prefix], self._current_paths[prefix] = self._open_writer(prefix)
+
+            writer = self._writers[prefix]
+            current_path = self._current_paths[prefix]
+            assert writer is not None and current_path is not None
+            writer.write_table(table)
+
+            current_size = current_path.stat().st_size
+            if current_size >= self.max_file_bytes:
+                self._close_writer(prefix)
+
+    def _merge_metadata(self, metadata_by_hash: dict[str, dict]) -> None:
+        for song_hash, meta in metadata_by_hash.items():
+            if song_hash not in self._metadata_by_hash:
+                self._metadata_by_hash[song_hash] = meta
+                continue
+            self._metadata_by_hash[song_hash]["difficulties"].extend(meta["difficulties"])
+            if self._metadata_by_hash[song_hash].get("score") is None and meta.get("score") is not None:
+                self._metadata_by_hash[song_hash]["score"] = meta["score"]
+
+    def append(self, beatmaps: list[NormalizedBeatmap]) -> None:
+        if self._closed:
+            raise RuntimeError("Cannot append after close()")
+        if not beatmaps:
+            return
+
+        tables_by_prefix, metadata_by_hash = _beatmaps_to_tables(beatmaps)
+        for prefix in ("notes", "bombs", "obstacles"):
+            self._append_tables(prefix, tables_by_prefix[prefix])
+        self._merge_metadata(metadata_by_hash)
+
+    def close(self) -> None:
+        if self._closed:
+            return
+        for prefix in _SCHEMAS:
+            self._close_writer(prefix)
+
+        metadata_list = list(self._metadata_by_hash.values())
+        with open(self.output_dir / "metadata.json", "w", encoding="utf-8") as f:
+            json.dump(metadata_list, f, indent=2)
+
+        logger.info(
+            "Wrote %d notes files, %d bombs files, %d obstacles files to %s",
+            len(self._written_files["notes"]),
+            len(self._written_files["bombs"]),
+            len(self._written_files["obstacles"]),
+            self.output_dir,
+        )
+        self._closed = True
+
+    def __enter__(self) -> "ParquetWriteSession":
+        return self
+
+    def __exit__(self, exc_type, exc, exc_tb) -> None:
+        if exc_type is None:
+            self.close()
+        else:
+            for prefix in _SCHEMAS:
+                self._close_writer(prefix)
+            self._closed = True
+
+
+def write_parquet(
+    beatmaps: list[NormalizedBeatmap],
+    output_dir: Path,
+    max_file_bytes: int = MAX_FILE_BYTES,
+) -> None:
+    """Write a list of normalized beatmaps to Parquet files and JSON metadata."""
+    with ParquetWriteSession(output_dir, max_file_bytes=max_file_bytes) as session:
+        session.append(beatmaps)
 
 
 def read_notes_parquet(path: Path) -> pa.Table:
@@ -300,7 +363,6 @@ def read_notes_parquet(path: Path) -> pa.Table:
     if path.is_dir():
         files = sorted(path.glob("notes_*.parquet"))
         if not files:
-            # Backward compat: try single-file layout
             single = path / "notes.parquet"
             if single.exists():
                 return pq.read_table(single)

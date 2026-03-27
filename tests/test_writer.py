@@ -13,6 +13,8 @@ from beat_weaver.schemas.normalized import (
 )
 from beat_weaver.storage.writer import (
     MAX_FILE_BYTES,
+    ParquetWriteSession,
+    has_processed_output,
     read_notes_parquet,
     write_parquet,
 )
@@ -129,6 +131,41 @@ class TestWriteParquet:
         obstacles_files = list(tmp_path.glob("obstacles_*.parquet"))
         assert len(bombs_files) >= 1
         assert len(obstacles_files) >= 1
+
+    def test_rejects_non_empty_processed_output(self, tmp_path):
+        """Writers should not append into an existing processed directory by default."""
+        (tmp_path / "notes_0000.parquet").write_bytes(b"placeholder")
+        assert has_processed_output(tmp_path) is True
+        with pytest.raises(FileExistsError):
+            write_parquet([_make_beatmap("song")], tmp_path)
+
+    def test_session_appends_multiple_batches(self, tmp_path):
+        """Append sessions should preserve all rows across multiple flushes."""
+        with ParquetWriteSession(tmp_path) as session:
+            session.append([_make_beatmap("batch_a", n_notes=4)])
+            session.append([
+                _make_beatmap("batch_b", n_notes=6),
+                _make_beatmap("batch_c", n_notes=8),
+            ])
+
+        table = read_notes_parquet(tmp_path)
+        assert table.num_rows == 18
+
+        pf = pq.ParquetFile(tmp_path / "notes_0000.parquet")
+        assert pf.metadata.num_row_groups == 3
+
+    def test_skips_malformed_song_during_arrow_conversion(self, tmp_path):
+        """A single malformed song should be skipped without aborting the whole write."""
+        bad = _make_beatmap("bad_song", n_notes=2)
+        bad.notes[0].angle_offset = -2147483648
+        good = _make_beatmap("good_song", n_notes=3)
+
+        with ParquetWriteSession(tmp_path) as session:
+            session.append([bad, good])
+
+        table = read_notes_parquet(tmp_path)
+        assert table.num_rows == 3
+        assert set(table.column("song_hash").to_pylist()) == {"good_song"}
 
 
 class TestFileSplitting:
