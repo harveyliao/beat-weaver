@@ -21,11 +21,14 @@ def parse_v2_notes(beatmap: dict, bpm: float) -> tuple[list[Note], list[Bomb]]:
     bombs: list[Bomb] = []
 
     for raw in beatmap.get("_notes", []):
-        beat = raw["_time"]
+        try:
+            beat = raw["_time"]
+            note_type = raw["_type"]
+        except KeyError:
+            continue
         time_seconds = beat * 60.0 / bpm
-        x = raw["_lineIndex"]
-        y = raw["_lineLayer"]
-        note_type = raw["_type"]
+        x = raw.get("_lineIndex", 0)
+        y = raw.get("_lineLayer", 0)
 
         if note_type == 3:
             bombs.append(Bomb(
@@ -41,7 +44,7 @@ def parse_v2_notes(beatmap: dict, bpm: float) -> tuple[list[Note], list[Bomb]]:
                 x=x,
                 y=y,
                 color=note_type,
-                cut_direction=raw["_cutDirection"],
+                cut_direction=raw.get("_cutDirection", 8),
                 angle_offset=0,
             ))
 
@@ -63,9 +66,15 @@ def parse_v2_obstacles(beatmap: dict, bpm: float) -> list[Obstacle]:
     obstacles: list[Obstacle] = []
 
     for raw in beatmap.get("_obstacles", []):
-        beat = raw["_time"]
-        time_seconds = beat * 60.0 / bpm
-        obstacle_type = raw["_type"]
+        try:
+            beat = raw["_time"]
+            time_seconds = beat * 60.0 / bpm
+            obstacle_type = raw["_type"]
+            duration_beats = raw["_duration"]
+            x = raw["_lineIndex"]
+            width = raw["_width"]
+        except KeyError:
+            continue
 
         if obstacle_type == 1:
             y = 2
@@ -77,10 +86,10 @@ def parse_v2_obstacles(beatmap: dict, bpm: float) -> list[Obstacle]:
         obstacles.append(Obstacle(
             beat=beat,
             time_seconds=time_seconds,
-            duration_beats=raw["_duration"],
-            x=raw["_lineIndex"],
+            duration_beats=duration_beats,
+            x=x,
             y=y,
-            width=raw["_width"],
+            width=width,
             height=height,
         ))
 

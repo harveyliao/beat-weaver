@@ -6,6 +6,7 @@ from pathlib import Path
 
 import pytest
 
+from beat_weaver.cli import _should_process_map_folder
 from beat_weaver.parsers.beatmap_parser import parse_map_folder
 from beat_weaver.parsers.dat_reader import read_dat_file
 from beat_weaver.parsers.info_parser import parse_info
@@ -122,3 +123,25 @@ class TestBeatmapParser:
         (tmp_path / "Info.dat").write_text(json.dumps(info))
         results = parse_map_folder(tmp_path)
         assert results == []  # Missing file is skipped, not an error
+
+
+class TestFolderFiltering:
+    def test_process_regular_map_folder(self, tmp_path):
+        map_folder = tmp_path / "beatsaver" / "abc123"
+        map_folder.mkdir(parents=True)
+        assert _should_process_map_folder(map_folder, tmp_path) is True
+
+    def test_skip_autosave_folder(self, tmp_path):
+        map_folder = tmp_path / "beatsaver" / "abc123" / "autosaves" / "2025-01-01"
+        map_folder.mkdir(parents=True)
+        assert _should_process_map_folder(map_folder, tmp_path) is False
+
+    def test_skip_backup_folder(self, tmp_path):
+        map_folder = tmp_path / "beatsaver" / "abc123" / "Backups" / "2020-02-19-02-11-13"
+        map_folder.mkdir(parents=True)
+        assert _should_process_map_folder(map_folder, tmp_path) is False
+
+    def test_skip_tilde_prefixed_backup_folder(self, tmp_path):
+        map_folder = tmp_path / "beatsaver" / "abc123" / "~Song_Backups" / "snapshot"
+        map_folder.mkdir(parents=True)
+        assert _should_process_map_folder(map_folder, tmp_path) is False

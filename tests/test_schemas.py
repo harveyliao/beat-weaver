@@ -75,6 +75,29 @@ class TestV2Parser:
         assert notes == []
         assert bombs == []
 
+    def test_skip_malformed_notes(self):
+        beatmap = {
+            "_notes": [
+                {"_time": 4.0, "_lineIndex": 1, "_lineLayer": 0, "_type": 0, "_cutDirection": 1},
+                {"_time": 5.0, "_lineIndex": 2, "_type": 1},
+                {"_lineIndex": 0, "_lineLayer": 0, "_type": 0, "_cutDirection": 1},
+            ]
+        }
+        notes, bombs = parse_v2_notes(beatmap, bpm=120.0)
+        assert len(notes) == 2
+        assert len(bombs) == 0
+        assert notes[1].cut_direction == 8
+
+    def test_skip_malformed_obstacles(self):
+        beatmap = {
+            "_obstacles": [
+                {"_time": 10.0, "_lineIndex": 0, "_type": 0, "_duration": 2.0, "_width": 1},
+                {"_time": 15.0, "_type": 1, "_duration": 1.0, "_width": 4},
+            ]
+        }
+        obstacles = parse_v2_obstacles(beatmap, bpm=120.0)
+        assert len(obstacles) == 1
+
 
 class TestV3Parser:
     def test_parse_notes(self):
@@ -102,6 +125,27 @@ class TestV3Parser:
         assert len(obstacles) == 1
         assert obstacles[0].height == 3
         assert obstacles[0].width == 1
+
+    def test_skip_malformed_notes_and_obstacles(self):
+        beatmap = {
+            "colorNotes": [
+                {"b": 4.0, "x": 1, "y": 0, "c": 0, "d": 1},
+                {"x": 2, "y": 0, "c": 1, "d": 1},
+            ],
+            "bombNotes": [
+                {"b": 6.0, "x": 2, "y": 1},
+                {"x": 1, "y": 0},
+            ],
+            "obstacles": [
+                {"b": 10.0, "x": 0, "y": 0, "d": 2.0, "w": 1, "h": 3},
+                {"x": 4, "h": 5},
+            ],
+        }
+        notes, bombs = parse_v3_notes(beatmap, bpm=140.0)
+        obstacles = parse_v3_obstacles(beatmap, bpm=140.0)
+        assert len(notes) == 1
+        assert len(bombs) == 1
+        assert len(obstacles) == 1
 
 
 class TestV4Parser:

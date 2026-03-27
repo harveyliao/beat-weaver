@@ -21,7 +21,10 @@ def parse_v3_notes(beatmap: dict, bpm: float) -> tuple[list[Note], list[Bomb]]:
     bombs: list[Bomb] = []
 
     for raw in beatmap.get("colorNotes", []):
-        beat = raw["b"]
+        try:
+            beat = raw["b"]
+        except KeyError:
+            continue
         time_seconds = beat * 60.0 / bpm
         notes.append(Note(
             beat=beat,
@@ -34,7 +37,10 @@ def parse_v3_notes(beatmap: dict, bpm: float) -> tuple[list[Note], list[Bomb]]:
         ))
 
     for raw in beatmap.get("bombNotes", []):
-        beat = raw["b"]
+        try:
+            beat = raw["b"]
+        except KeyError:
+            continue
         time_seconds = beat * 60.0 / bpm
         bombs.append(Bomb(
             beat=beat,
@@ -61,7 +67,10 @@ def parse_v3_obstacles(beatmap: dict, bpm: float) -> list[Obstacle]:
     obstacles: list[Obstacle] = []
 
     for raw in beatmap.get("obstacles", []):
-        beat = raw["b"]
+        try:
+            beat = raw["b"]
+        except KeyError:
+            continue
         time_seconds = beat * 60.0 / bpm
         obstacles.append(Obstacle(
             beat=beat,
