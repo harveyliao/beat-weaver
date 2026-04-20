@@ -72,6 +72,127 @@ Operational note from local measurements on an `RTX 5070 Ti (15.92 GB VRAM)`:
 
 See [plans/009-muq-frame-alignment-experiments.md](plans/009-muq-frame-alignment-experiments.md) for the measured timings and memory observations.
 
+## Prepare Data Here, Train In `muq-beat-weaver`
+
+If you want other people to reproduce the full pipeline, use this repo as the corpus builder and
+use the sibling repo `../muq-beat-weaver` for MuQ-first training and inference.
+
+Expected layout:
+
+```text
+E:\github_repos\
+  beat-weaver\
+  muq-beat-weaver\
+```
+
+### 1. Build the corpus in `beat-weaver`
+
+From this repo:
+
+```bash
+# 1) Download community maps
+beat-weaver download --min-score 0.75 --output data/raw/beatsaver
+
+# 2) Extract official maps if you have Beat Saber installed
+beat-weaver extract-official --output data/raw/official
+
+# 3) Normalize into parquet
+beat-weaver process --input data/raw --output data/processed
+
+# 4) Build the audio manifest consumed by the MuQ repo
+beat-weaver build-manifest --input data/raw --output data/audio_manifest.json
+```
+
+Artifacts that `../muq-beat-weaver` expects from this repo:
+
+- `data/processed/`
+- `data/audio_manifest.json`
+- optional `data/raw/official/` if you want to run small local embedding/export checks here
+
+### 2. Switch to `../muq-beat-weaver` for timing + MuQ logistics
+
+From `../muq-beat-weaver`:
+
+```bash
+uv sync --extra ml --group dev
+```
+
+Build timing metadata against the corpus produced by this repo:
+
+```bash
+uv run python scripts/build_timing_metadata.py \
+  --audio-manifest ../beat-weaver/data/audio_manifest.json \
+  --processed-dir ../beat-weaver/data/processed
+```
+
+Build beat-grid MuQ cache from the processed corpus:
+
+```bash
+uv run python scripts/build_muq_beatgrid_cache.py \
+  --processed-dir ../beat-weaver/data/processed
+```
+
+Audit the resulting training targets before a long run:
+
+```bash
+uv run python scripts/audit_training_targets.py \
+  --config configs/muq_frozen_base_bs8_45ep.json \
+  --audio-manifest ../beat-weaver/data/audio_manifest.json \
+  --processed-dir ../beat-weaver/data/processed \
+  --output-json output/audit_training_targets.json
+```
+
+### 3. Train in `../muq-beat-weaver`
+
+```bash
+uv run python scripts/train_muq_precomputed.py \
+  --config configs/muq_frozen_base_bs8_45ep.json \
+  --audio-manifest ../beat-weaver/data/audio_manifest.json \
+  --processed-dir ../beat-weaver/data/processed \
+  --output-dir output/muq_precomputed_beatsaver_base_bs8
+```
+
+Resume from a saved checkpoint:
+
+```bash
+uv run python scripts/train_muq_precomputed.py \
+  --config configs/muq_frozen_base_bs8_45ep.json \
+  --audio-manifest ../beat-weaver/data/audio_manifest.json \
+  --processed-dir ../beat-weaver/data/processed \
+  --output-dir output/muq_precomputed_beatsaver_base_bs8 \
+  --resume-from output/muq_precomputed_beatsaver_base_bs8/checkpoints/best
+```
+
+### 4. Run inference/export in `../muq-beat-weaver`
+
+```bash
+uv run python scripts/generate_from_audio.py \
+  --checkpoint output/muq_precomputed_beatsaver_base_bs8/checkpoints/best \
+  --audio data/inference/song.ogg \
+  --bpm 128 \
+  --difficulty Expert \
+  --inference-mode rolling \
+  --candidates 4 \
+  --output-dir output/generated/song_expert
+```
+
+If you already built timing metadata for the corpus or for a specific song, pass it through during generation:
+
+```bash
+uv run python scripts/generate_from_audio.py \
+  --checkpoint output/muq_precomputed_beatsaver_base_bs8/checkpoints/best \
+  --audio data/inference/song.ogg \
+  --timing-metadata ../beat-weaver/data/processed/timing_metadata.json \
+  --timing-hash SONG_HASH_HERE \
+  --difficulty Expert \
+  --output-dir output/generated/song_with_timing
+```
+
+This separation is intentional:
+
+- `beat-weaver` owns raw map download, official extraction, manifest building, and parquet generation
+- `muq-beat-weaver` owns timing experiments, MuQ cache construction, MuQ-precomputed training, and audio-to-map inference
+
 ## Quick Start: Training a Model
 
 This is the end-to-end workflow from a fresh clone to a trained model.
