@@ -22,9 +22,12 @@ from beat_weaver.model.audio import (
     beat_align_spectrogram,
     compute_mel_spectrogram,
     compute_mel_with_onset,
+    interpolate_muq_to_beat_grid,
     load_audio,
     load_manifest,
 )
+
+_MUQ_FEATURE_DIM = 1024
 from beat_weaver.model.config import ModelConfig
 from beat_weaver.model.tokenizer import encode_beatmap
 from beat_weaver.schemas.normalized import (
@@ -35,7 +38,7 @@ from beat_weaver.schemas.normalized import (
 )
 
 logger = logging.getLogger(__name__)
-_DATASET_CACHE_VERSION = "3"
+_DATASET_CACHE_VERSION = "4"
 
 
 @dataclass(slots=True)
@@ -258,6 +261,8 @@ def _dataset_cache_key(
         "min_bpm": config.min_bpm,
         "max_bpm": config.max_bpm,
         "splits": include_splits,
+        "encoder_type": config.encoder_type,
+        "max_audio_duration": config.max_audio_duration,
     }
     digest.update(json.dumps(config_state, sort_keys=True).encode("utf-8"))
 
@@ -408,7 +413,10 @@ def prepare_dataset_corpus(
     metadata = _load_metadata_dict(processed_dir)
     _backfill_beatsaver_scores_in_place(metadata, audio_manifest)
 
-    mel_cache_dir = processed_dir / "mel_cache"
+    if config.encoder_type == "muq":
+        mel_cache_dir = processed_dir / "muq_cache"
+    else:
+        mel_cache_dir = processed_dir / "mel_cache"
     mel_cache_dir.mkdir(parents=True, exist_ok=True)
 
     from beat_weaver.storage.writer import read_notes_parquet
@@ -430,9 +438,10 @@ def prepare_dataset_corpus(
 
     min_diff_rank = BeatSaberDataset._DIFF_RANK.get(config.min_difficulty, 1)
     allowed_chars = set(config.characteristics) if config.characteristics else None
-    filtered_counts = {"difficulty": 0, "characteristic": 0, "bpm": 0, "audio": 0}
+    filtered_counts = {"difficulty": 0, "characteristic": 0, "bpm": 0, "audio": 0, "duration": 0}
     audio_ok: dict[str, bool] = {}
     samples: list[dict] = []
+    max_dur = config.max_audio_duration
 
     for (song_hash, difficulty, characteristic), group in grouped:
         if song_hash not in allowed_hashes:
@@ -450,14 +459,44 @@ def prepare_dataset_corpus(
         if bpm < config.min_bpm or bpm > config.max_bpm:
             filtered_counts["bpm"] += 1
             continue
-        mel_path = mel_cache_dir / f"{song_hash}_{bpm}.npy"
+        if config.encoder_type == "muq":
+            mel_path = mel_cache_dir / f"{song_hash}.npy"
+        else:
+            mel_path = mel_cache_dir / f"{song_hash}_{bpm}.npy"
+        # Duration filter: check cached feature length as proxy for audio duration
+        if max_dur > 0 and mel_path.exists():
+            if song_hash not in audio_ok:
+                cached = np.load(mel_path)
+                if config.encoder_type == "muq":
+                    cached_duration = cached.shape[0] / 25.0
+                else:
+                    subs_per_second = (bpm / 60.0) * 16
+                    cached_duration = cached.shape[1] / subs_per_second if subs_per_second > 0 else 0
+                if cached_duration > max_dur:
+                    audio_ok[song_hash] = False
+                    filtered_counts["duration"] += 1
+                else:
+                    audio_ok[song_hash] = True
+            if not audio_ok.get(song_hash, True):
+                continue
         if not mel_path.exists():
+            # MuQ features must be pre-cached; skip uncached songs
+            if config.encoder_type == "muq":
+                if song_hash not in audio_ok:
+                    audio_ok[song_hash] = False
+                    filtered_counts["audio"] += 1
+                continue
             is_decodable = audio_ok.get(song_hash)
             if is_decodable is None:
                 audio_path = audio_manifest[song_hash]
                 try:
-                    load_audio(Path(audio_path), sr=config.sample_rate)
-                    is_decodable = True
+                    audio_data, _ = load_audio(Path(audio_path), sr=config.sample_rate)
+                    duration = len(audio_data) / config.sample_rate
+                    if max_dur > 0 and duration > max_dur:
+                        is_decodable = False
+                        filtered_counts["duration"] += 1
+                    else:
+                        is_decodable = True
                 except Exception as e:
                     logger.warning(
                         "Filtering out song %s: failed to decode %s: %s",
@@ -579,8 +618,11 @@ class BeatSaberDataset(Dataset):
         # when metadata.json was generated before score injection existed.
         self._backfill_beatsaver_scores()
 
-        # Mel spectrogram cache directory
-        self.mel_cache_dir = self.processed_dir / "mel_cache"
+        # Feature cache directory (mel or muq)
+        if config.encoder_type == "muq":
+            self.mel_cache_dir = self.processed_dir / "muq_cache"
+        else:
+            self.mel_cache_dir = self.processed_dir / "mel_cache"
         self.mel_cache_dir.mkdir(parents=True, exist_ok=True)
 
         # Load notes from Parquet using pandas groupby (vectorized)
@@ -626,8 +668,17 @@ class BeatSaberDataset(Dataset):
             if bpm < config.min_bpm or bpm > config.max_bpm:
                 filtered_counts["bpm"] += 1
                 continue
-            cache_path = self.mel_cache_dir / f"{song_hash}_{bpm}.npy"
+            if self.config.encoder_type == "muq":
+                cache_path = self.mel_cache_dir / f"{song_hash}.npy"
+            else:
+                cache_path = self.mel_cache_dir / f"{song_hash}_{bpm}.npy"
             if not cache_path.exists():
+                # MuQ features must be pre-cached; skip uncached songs
+                if self.config.encoder_type == "muq":
+                    if song_hash not in audio_ok:
+                        audio_ok[song_hash] = False
+                        filtered_counts["audio"] += 1
+                    continue
                 is_decodable = audio_ok.get(song_hash)
                 if is_decodable is None:
                     audio_path = self.audio_manifest[song_hash]
@@ -781,10 +832,20 @@ class BeatSaberDataset(Dataset):
         token_ids = sample["token_ids"]
         mask = sample["token_mask"]
 
-        # Load mel spectrogram from cache or compute and cache
-        cache_path = self.mel_cache_dir / f"{song_hash}_{bpm}.npy"
+        # Load features from cache (mel or MuQ)
+        if self.config.encoder_type == "muq":
+            cache_path = self.mel_cache_dir / f"{song_hash}.npy"
+        else:
+            cache_path = self.mel_cache_dir / f"{song_hash}_{bpm}.npy"
         if cache_path.exists():
             mel = np.load(cache_path)
+            # Raw MuQ features are (T_muq, 1024) at 25 Hz — interpolate to beat grid
+            if self.config.encoder_type == "muq":
+                mel = interpolate_muq_to_beat_grid(mel, bpm)
+        elif self.config.encoder_type == "muq":
+            raise FileNotFoundError(
+                f"MuQ cache missing for {song_hash}. Run warm_muq_cache() first."
+            )
         else:
             audio_path = self.audio_manifest[song_hash]
             audio, sr = load_audio(Path(audio_path), sr=self.config.sample_rate)
@@ -811,8 +872,8 @@ class BeatSaberDataset(Dataset):
         if mel.shape[1] > self.config.max_audio_len:
             mel = mel[:, : self.config.max_audio_len]
 
-        # SpecAugment: random time/frequency masking (training only)
-        if self.split == "train":
+        # SpecAugment: random time/frequency masking (training only, mel features only)
+        if self.split == "train" and self.config.encoder_type != "muq":
             mel = self._spec_augment(mel)
 
         return (

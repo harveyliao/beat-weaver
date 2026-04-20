@@ -112,3 +112,89 @@ Only pursue this if Option A shows artifacts attributable to interpolation (unli
 - Projection layer: `Linear(1024, decoder_dim)` + optional LayerNorm
 - MuQ runs in fp32 during caching (recommended by MuQ authors to avoid NaNs)
 - Config additions: `encoder_type`, `muq_model_name`, `freeze_encoder`, etc. (see plan 007)
+
+## Local validation notes
+
+The local editable `muq` install from `../MuQ` was validated in the shared `.venv`:
+
+- `MuQ.from_pretrained("OpenMuQ/MuQ-large-msd-iter")` loads successfully
+- short CUDA inference returns stable outputs with no NaNs
+- output shape follows the expected `25 Hz` frame rate and `1024` hidden size
+
+An embedding export path was added to this repo:
+
+```bash
+python -m beat_weaver.cli embed-muq \
+  --input data/raw/official \
+  --output output/muq_embeddings/official_first5 \
+  --limit-subfolders 5
+```
+
+The first five official songs exported successfully and produced one `.npy` plus one `.json`
+summary per song under `output/muq_embeddings/official_first5/`.
+
+### Measured runtime and memory behavior
+
+Hardware used for these checks:
+
+- GPU: `NVIDIA GeForce RTX 5070 Ti`
+- Reported VRAM: `15.92 GB`
+- MuQ model: `OpenMuQ/MuQ-large-msd-iter`
+- Precision: `fp32`
+
+Observed inference timings for zero-waveform probes at 24 kHz:
+
+| Audio length | Output frames | Inference time |
+|--------------|---------------|----------------|
+| 60s | 1500 | 0.422s |
+| 120s | 3000 | 0.312s |
+| 180s | 4500 | 0.527s |
+| 240s | 6000 | 0.755s |
+| 300s | 7500 | 4.198s |
+| 315s | 7875 | 37.813s |
+| 330s | 8250 | 186.706s |
+| 360s | 9000 | 235.691s |
+
+Observed peak CUDA allocations from the same probing pass:
+
+| Audio length | Peak allocated | Peak reserved |
+|--------------|----------------|---------------|
+| 240s | 8.431 GB | 13.158 GB |
+| 300s | 12.250 GB | 17.881 GB |
+| 315s | 13.015 GB | 18.904 GB |
+| 330s | 14.124 GB | 20.301 GB |
+| 360s | 16.911 GB | 23.730 GB |
+
+Interpretation:
+
+- MuQ stays fast through roughly `5:00` audio on this GPU.
+- There is a clear latency cliff between about `5:15` and `5:30`.
+- Songs longer than about `330s` are likely to become dramatically slower.
+- This behavior is consistent with VRAM oversubscription / memory migration, even though the exact paging mechanism is not directly proven by the PyTorch counters alone.
+
+Practical guidance for Beat Weaver:
+
+- treat `<= 300s` as the safe single-pass MuQ inference range on a 16 GB class GPU
+- treat `315-330s` as the risk zone
+- expect songs longer than `330s` to need chunked/windowed MuQ inference for predictable throughput
+- for a default pre-cache cap, prefer `250s`
+
+Recommended default cap from the denser `angelvoices/song.wav` sweep (`60s` to `300s` in `10s`
+steps):
+
+- MuQ stays smooth through `250s` (`0.806s` inference)
+- the first clear knee appears at `260s` (`1.198s`)
+- slowdown then compounds at `270s+`
+
+Conclusion:
+
+- use `250s` as the default MuQ cap length when a fixed single-pass limit is needed
+- `260s` is the upper edge of the acceptable range, but leaves less safety margin across songs
+- chunked/windowed MuQ extraction is still the preferred long-term fix for songs beyond that cap
+
+One real-song example from the export run matched this pattern:
+
+- `angelvoices` (`372s`) took `244.752s` for MuQ inference
+- shorter songs in the same batch completed in roughly `0.65s` to `41.42s`
+
+This is the strongest current argument for adding chunked MuQ embedding extraction before relying on full-song caching at scale.

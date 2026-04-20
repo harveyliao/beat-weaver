@@ -49,6 +49,29 @@ Verify the installation:
 uv run python -c "import torch, torchaudio; print(torch.__version__); print(torch.version.cuda); print(torch.cuda.is_available())"
 ```
 
+## MuQ Notes
+
+This repo also has an experimental MuQ encoder path (`encoder_type="muq"`). MuQ expects
+mono `24 kHz` audio and currently runs inference in `fp32`.
+
+You can export MuQ embeddings for local audio folders with:
+
+```bash
+beat-weaver embed-muq \
+  --input data/raw/official \
+  --output output/muq_embeddings/official_first5 \
+  --limit-subfolders 5
+```
+
+Operational note from local measurements on an `RTX 5070 Ti (15.92 GB VRAM)`:
+
+- MuQ single-pass inference is fast up to about `300s` of audio
+- a major slowdown appears around `315-330s`
+- a good default fixed cap is `250s`
+- songs longer than about `330s` should be treated as candidates for chunked/windowed MuQ inference
+
+See [plans/009-muq-frame-alignment-experiments.md](plans/009-muq-frame-alignment-experiments.md) for the measured timings and memory observations.
+
 ## Quick Start: Training a Model
 
 This is the end-to-end workflow from a fresh clone to a trained model.

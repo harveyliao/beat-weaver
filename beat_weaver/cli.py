@@ -192,6 +192,7 @@ def cmd_train(args: argparse.Namespace) -> None:
     )
     from beat_weaver.model.config import ModelConfig
     from beat_weaver.model.dataset import build_train_val_datasets, warm_mel_cache
+    from beat_weaver.model.audio import warm_muq_cache
     from beat_weaver.model.training import TrainDebugOptions, train
 
     config = ModelConfig()
@@ -209,8 +210,11 @@ def cmd_train(args: argparse.Namespace) -> None:
 
     data_dir = Path(args.data)
 
-    # Pre-compute mel spectrograms in parallel before training
-    warm_mel_cache(data_dir, manifest_path, config)
+    # Pre-compute audio features before training
+    if config.encoder_type == "muq":
+        warm_muq_cache(data_dir, manifest_path, config, max_songs=args.max_cache_songs)
+    else:
+        warm_mel_cache(data_dir, manifest_path, config)
 
     train_ds, val_ds = build_train_val_datasets(data_dir, manifest_path, config)
 
@@ -260,33 +264,52 @@ def cmd_generate(args: argparse.Namespace) -> None:
     )
     model.eval()
 
-    audio, sr = load_audio(Path(args.audio), sr=config.sample_rate)
+    if config.encoder_type == "muq":
+        from beat_weaver.model.audio import interpolate_muq_to_beat_grid
 
-    bpm = args.bpm
-    if bpm is None:
-        bpm = detect_bpm(audio, sr=sr)
-        print(f"Auto-detected BPM: {bpm:.1f}")
+        audio, sr = load_audio(Path(args.audio), sr=24000)
+        bpm = args.bpm
+        if bpm is None:
+            bpm = detect_bpm(audio, sr=sr)
+            print(f"Auto-detected BPM: {bpm:.1f}")
 
-    if config.use_onset_features:
-        mel = compute_mel_with_onset(
-            audio,
-            sr=sr,
-            n_mels=config.n_mels,
-            n_fft=config.n_fft,
-            hop_length=config.hop_length,
-        )
+        from muq import MuQ
+
+        muq_model = MuQ.from_pretrained(config.muq_model_name)
+        muq_model.eval()
+        with torch.no_grad():
+            wav_tensor = torch.from_numpy(audio).unsqueeze(0).float()
+            output = muq_model(wav_tensor)
+            features = output.last_hidden_state[0].numpy()
+        mel = interpolate_muq_to_beat_grid(features, bpm)
+        mel_tensor = torch.from_numpy(mel)
     else:
-        mel = compute_mel_spectrogram(
-            audio,
-            sr=sr,
-            n_mels=config.n_mels,
-            n_fft=config.n_fft,
-            hop_length=config.hop_length,
-        )
+        audio, sr = load_audio(Path(args.audio), sr=config.sample_rate)
+        bpm = args.bpm
+        if bpm is None:
+            bpm = detect_bpm(audio, sr=sr)
+            print(f"Auto-detected BPM: {bpm:.1f}")
 
-    # Beat-align to match training data preprocessing
-    mel = beat_align_spectrogram(mel, sr=sr, hop_length=config.hop_length, bpm=bpm)
-    mel_tensor = torch.from_numpy(mel)
+        if config.use_onset_features:
+            mel = compute_mel_with_onset(
+                audio,
+                sr=sr,
+                n_mels=config.n_mels,
+                n_fft=config.n_fft,
+                hop_length=config.hop_length,
+            )
+        else:
+            mel = compute_mel_spectrogram(
+                audio,
+                sr=sr,
+                n_mels=config.n_mels,
+                n_fft=config.n_fft,
+                hop_length=config.hop_length,
+            )
+
+        # Beat-align to match training data preprocessing
+        mel = beat_align_spectrogram(mel, sr=sr, hop_length=config.hop_length, bpm=bpm)
+        mel_tensor = torch.from_numpy(mel)
 
     notes = generate_full_song(
         model,
@@ -373,6 +396,37 @@ def cmd_evaluate(args: argparse.Namespace) -> None:
     output_path = Path(args.output) if args.output else Path("evaluation_results.json")
     output_path.write_text(_json.dumps(results, indent=2), encoding="utf-8")
     print(f"Evaluated {len(results)} maps. Results: {output_path}")
+
+
+def cmd_embed_muq(args: argparse.Namespace) -> None:
+    from beat_weaver.model.muq_embeddings import (
+        export_embeddings,
+        find_audio_files_in_subfolders,
+    )
+
+    input_dir = Path(args.input)
+    output_dir = Path(args.output)
+    audio_paths = find_audio_files_in_subfolders(
+        input_dir,
+        limit=args.limit_subfolders if args.limit_subfolders > 0 else None,
+    )
+    if not audio_paths:
+        raise SystemExit(f"No audio files found under {input_dir}")
+
+    summary = export_embeddings(
+        audio_paths,
+        output_dir,
+        model_name=args.model_name,
+        device=args.device,
+    )
+    aggregate = summary["aggregate"]
+    print(
+        "Exported "
+        f"{summary['num_files']} MuQ embedding files to {output_dir} "
+        f"on {summary['device']} in {summary['total_wall_seconds']:.2f}s "
+        f"(mean inference {aggregate['mean_inference_seconds']:.3f}s, "
+        f"total embedding bytes {aggregate['total_embedding_bytes']})"
+    )
 
 
 def cmd_run(args: argparse.Namespace) -> None:
@@ -521,6 +575,12 @@ def main() -> None:
         action="store_true",
         help="Skip validation during short profiling runs",
     )
+    tr.add_argument(
+        "--max-cache-songs",
+        type=int,
+        default=None,
+        help="Limit MuQ/mel cache warming to this many songs (for quick validation runs)",
+    )
 
     # generate
     gen = sub.add_parser("generate", help="Generate a Beat Saber map from audio")
@@ -550,6 +610,26 @@ def main() -> None:
     ev.add_argument("--audio-manifest", required=True, help="Audio manifest JSON path")
     ev.add_argument("--output", default=None, help="Output JSON path for results")
 
+    emb = sub.add_parser("embed-muq", help="Export MuQ embeddings for audio folders")
+    emb.add_argument("--input", required=True, help="Root directory of map/audio folders")
+    emb.add_argument("--output", required=True, help="Output directory for .npy and JSON files")
+    emb.add_argument(
+        "--limit-subfolders",
+        type=int,
+        default=0,
+        help="Only process the first N sorted subfolders (default: 0 = all)",
+    )
+    emb.add_argument(
+        "--model-name",
+        default="OpenMuQ/MuQ-large-msd-iter",
+        help="MuQ Hugging Face model identifier",
+    )
+    emb.add_argument(
+        "--device",
+        default=None,
+        help="Torch device override, e.g. cpu or cuda",
+    )
+
     args = parser.parse_args()
     logging.basicConfig(
         level=logging.DEBUG if args.verbose else logging.INFO,
@@ -565,6 +645,7 @@ def main() -> None:
         "train": cmd_train,
         "generate": cmd_generate,
         "evaluate": cmd_evaluate,
+        "embed-muq": cmd_embed_muq,
     }
 
     handler = commands.get(args.command)

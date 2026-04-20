@@ -16,6 +16,8 @@ from scipy.interpolate import interp1d
 from tqdm import tqdm
 
 logger = logging.getLogger(__name__)
+_MUQ_LABEL_RATE = 25.0
+_MUQ_DEFAULT_OVERLAP_SECONDS = 5.0
 
 
 def load_audio(path: Path, sr: int = 22050) -> tuple[np.ndarray, int]:
@@ -247,6 +249,274 @@ def _find_audio_in_folder(folder: Path, info_file: Path) -> Path | None:
         for f in folder.glob(f"*{ext}"):
             return f
     return None
+
+
+def interpolate_muq_to_beat_grid(
+    muq_features: np.ndarray,
+    bpm: float,
+    muq_hz: float = 25.0,
+    subdivisions_per_beat: int = 16,
+) -> np.ndarray:
+    """Resample MuQ features (25 Hz) onto the 1/16th note beat grid.
+
+    Args:
+        muq_features: (T_muq, 1024) — MuQ hidden states at 25 Hz.
+        bpm: Beats per minute.
+        muq_hz: MuQ output frame rate (default 25 Hz).
+        subdivisions_per_beat: Beat subdivisions (default 16 = 1/16th note).
+
+    Returns:
+        Float32 array of shape (1024, T_beats), transposed to match mel convention.
+    """
+    n_muq_frames, feat_dim = muq_features.shape
+    if n_muq_frames == 0:
+        return np.zeros((feat_dim, 0), dtype=np.float32)
+
+    duration = (n_muq_frames - 1) / muq_hz  # seconds
+
+    # Beat grid times
+    beats_per_second = bpm / 60.0
+    subs_per_second = beats_per_second * subdivisions_per_beat
+    total_subs = int(np.ceil(duration * subs_per_second))
+    if total_subs == 0:
+        return np.zeros((feat_dim, 0), dtype=np.float32)
+
+    sub_times = np.arange(total_subs) / subs_per_second  # seconds
+
+    # MuQ frame indices (fractional) for each beat position
+    muq_indices = sub_times * muq_hz  # float indices into MuQ frames
+    # Clip to valid range
+    muq_indices = np.clip(muq_indices, 0, n_muq_frames - 1)
+
+    # Linear interpolation in feature space
+    lo = np.floor(muq_indices).astype(int)
+    hi = np.minimum(lo + 1, n_muq_frames - 1)
+    frac = (muq_indices - lo).astype(np.float32)
+
+    aligned = (
+        muq_features[lo] * (1 - frac[:, None])
+        + muq_features[hi] * frac[:, None]
+    )
+
+    # Transpose to (feat_dim, T_beats) to match mel convention (n_mels, T)
+    return aligned.T.astype(np.float32)
+
+
+def _plan_muq_windows(
+    audio_seconds: float,
+    max_chunk_seconds: float,
+    overlap_seconds: float = _MUQ_DEFAULT_OVERLAP_SECONDS,
+) -> list[tuple[float, float, float]]:
+    """Plan overlapping MuQ windows as (start, end, trim_left) in seconds."""
+    if audio_seconds <= 0:
+        return []
+    if max_chunk_seconds <= 0 or audio_seconds <= max_chunk_seconds:
+        return [(0.0, audio_seconds, 0.0)]
+
+    overlap_seconds = max(0.0, min(overlap_seconds, max_chunk_seconds / 4.0))
+    stride_seconds = max_chunk_seconds - overlap_seconds
+    if stride_seconds <= 0:
+        return [(0.0, audio_seconds, 0.0)]
+
+    windows: list[tuple[float, float, float]] = []
+    start = 0.0
+    while start < audio_seconds:
+        end = min(start + max_chunk_seconds, audio_seconds)
+        trim_left = 0.0 if not windows else overlap_seconds
+        windows.append((start, end, trim_left))
+        if end >= audio_seconds:
+            break
+        start += stride_seconds
+    return windows
+
+
+def _extract_muq_features(
+    audio: np.ndarray,
+    model,
+    device,
+    *,
+    sample_rate: int = 24000,
+    max_chunk_seconds: float = 0.0,
+    overlap_seconds: float = _MUQ_DEFAULT_OVERLAP_SECONDS,
+) -> np.ndarray:
+    """Extract raw MuQ features, chunking long songs when requested."""
+    import torch
+
+    audio_seconds = len(audio) / sample_rate if sample_rate > 0 else 0.0
+    windows = _plan_muq_windows(audio_seconds, max_chunk_seconds, overlap_seconds)
+    if not windows:
+        return np.zeros((0, 1024), dtype=np.float32)
+
+    chunks: list[np.ndarray] = []
+    for start_sec, end_sec, trim_left_sec in windows:
+        start_sample = int(round(start_sec * sample_rate))
+        end_sample = int(round(end_sec * sample_rate))
+        chunk_audio = audio[start_sample:end_sample]
+
+        with torch.no_grad():
+            wav_tensor = torch.from_numpy(chunk_audio).unsqueeze(0).float().to(device)
+            output = model(wav_tensor)
+            features = output.last_hidden_state[0].cpu().numpy().astype(np.float32)
+            del wav_tensor, output
+
+        trim_left_frames = int(round(trim_left_sec * _MUQ_LABEL_RATE))
+        if trim_left_frames > 0:
+            features = features[trim_left_frames:]
+        chunks.append(features)
+
+        if getattr(device, "type", None) == "cuda":
+            torch.cuda.empty_cache()
+
+    if len(chunks) == 1:
+        return chunks[0]
+    return np.concatenate(chunks, axis=0)
+
+
+def _compute_one_muq(
+    audio_path: str,
+    song_hash: str,
+    cache_path: str,
+    muq_model_name: str,
+    max_audio_duration: float = 0.0,
+) -> str | None:
+    """Compute and cache raw MuQ features at 25 Hz.
+
+    Returns song_hash on success, None on error.
+    Saves shape (T_muq, 1024) — beat-grid interpolation is deferred to
+    dataset __getitem__ time.
+
+    NOTE: Unlike mel caching, MuQ caching is NOT parallelized with
+    ProcessPoolExecutor because MuQ requires GPU and loading the model
+    per-worker is wasteful. This function is called sequentially from
+    warm_muq_cache() which holds a single MuQ model instance.
+    """
+    try:
+        audio, _ = load_audio(Path(audio_path), sr=24000)
+        import torch
+        from muq import MuQ
+
+        # Load MuQ model (caller should pre-load; this is fallback)
+        model = MuQ.from_pretrained(muq_model_name)
+        model.eval()
+
+        features = _extract_muq_features(
+            audio,
+            model,
+            torch.device("cpu"),
+            sample_rate=24000,
+            max_chunk_seconds=max_audio_duration,
+        )
+
+        np.save(cache_path, features)
+        return song_hash
+    except Exception as e:
+        logger.warning("Failed to compute MuQ features for %s: %s", song_hash, e)
+        return None
+
+
+def warm_muq_cache(
+    processed_dir: Path,
+    audio_manifest_path: Path,
+    config: "ModelConfig",
+    max_songs: int | None = None,
+) -> int:
+    """Pre-compute raw MuQ features (25 Hz) for all songs in the manifest.
+
+    Runs a frozen MuQ model in fp32 on GPU (or CPU), extracts
+    last_hidden_state at 25 Hz, and saves raw features as .npy files
+    in ``muq_cache/``.  Beat-grid interpolation is deferred to dataset
+    ``__getitem__`` time (cheap linear interp).
+
+    Cache files are keyed by song hash only (no BPM), since raw MuQ
+    features are BPM-independent.
+
+    Returns the number of newly computed feature files.
+    """
+    import torch
+
+    cache_dir = processed_dir / "muq_cache"
+    cache_dir.mkdir(parents=True, exist_ok=True)
+
+    # Version check — invalidate if model name or cache format changes
+    version_file = cache_dir / "VERSION"
+    expected_version = f"raw_v2:{config.muq_model_name}"
+    needs_clear = False
+    if version_file.exists():
+        current_version = version_file.read_text(encoding="utf-8").strip()
+        if current_version != expected_version:
+            needs_clear = True
+    elif any(cache_dir.glob("*.npy")):
+        needs_clear = True
+    if needs_clear:
+        n_stale = sum(1 for _ in cache_dir.glob("*.npy"))
+        logger.warning(
+            "MuQ cache version mismatch (need %s). Clearing %d stale files.",
+            expected_version, n_stale,
+        )
+        for npy_file in cache_dir.glob("*.npy"):
+            npy_file.unlink()
+    version_file.write_text(expected_version, encoding="utf-8")
+
+    manifest = load_manifest(audio_manifest_path)
+
+    # Find songs that need MuQ computation (no BPM needed for raw features)
+    todo: list[tuple[str, str, str]] = []
+    for song_hash, audio_path in manifest.items():
+        cache_path = str(cache_dir / f"{song_hash}.npy")
+        if not Path(cache_path).exists():
+            todo.append((str(audio_path), song_hash, cache_path))
+
+    if not todo:
+        logger.info("MuQ cache is warm: all %d songs already cached", len(manifest))
+        return 0
+
+    if max_songs is not None and len(todo) > max_songs:
+        logger.info(
+            "Limiting MuQ cache warming to %d of %d songs", max_songs, len(todo),
+        )
+        todo = todo[:max_songs]
+
+    logger.info(
+        "Warming MuQ cache: %d songs to compute (%d already cached)",
+        len(todo), len(manifest) - len(todo),
+    )
+
+    # Load MuQ model once (fp32, GPU if available)
+    from muq import MuQ
+
+    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    muq_model = MuQ.from_pretrained(config.muq_model_name)
+    muq_model.eval()
+    muq_model.to(device)
+    logger.info("MuQ model loaded on %s", device)
+
+    computed = 0
+    max_dur = config.max_audio_duration
+    total = len(todo)
+
+    for i, (audio_path, song_hash, cache_path) in enumerate(todo, 1):
+        try:
+            audio, _ = load_audio(Path(audio_path), sr=24000)
+            features = _extract_muq_features(
+                audio,
+                muq_model,
+                device,
+                sample_rate=24000,
+                max_chunk_seconds=max_dur,
+            )
+
+            np.save(cache_path, features)
+            computed += 1
+        except Exception as e:
+            logger.warning("Failed to compute MuQ for %s: %s", song_hash, e)
+            if device.type == "cuda":
+                torch.cuda.empty_cache()
+
+        if i % 100 == 0 or i == total:
+            logger.info("MuQ cache progress: %d/%d computed", i, total)
+
+    logger.info("MuQ cache warm: %d newly computed", computed)
+    return computed
 
 
 def save_manifest(manifest: dict[str, str], path: Path) -> None:

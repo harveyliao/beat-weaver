@@ -11,6 +11,7 @@ sf = pytest.importorskip("soundfile")
 pytest.importorskip("librosa")
 
 from beat_weaver.model.audio import (
+    _plan_muq_windows,
     beat_align_spectrogram,
     build_audio_manifest,
     compute_mel_spectrogram,
@@ -233,3 +234,22 @@ class TestMelWithOnset:
         aligned = beat_align_spectrogram(mel, sr=sr, hop_length=512, bpm=120.0)
         assert aligned.shape[0] == 81  # n_mels+1 preserved
         assert aligned.shape[1] > 0
+
+
+class TestMuQWindowPlanning:
+    def test_single_window_when_shorter_than_cap(self):
+        windows = _plan_muq_windows(120.0, 250.0)
+        assert windows == [(0.0, 120.0, 0.0)]
+
+    def test_two_windows_for_330_seconds(self):
+        windows = _plan_muq_windows(330.0, 250.0)
+        assert windows == [
+            (0.0, 250.0, 0.0),
+            (245.0, 330.0, 5.0),
+        ]
+
+    def test_overlap_is_capped_for_small_chunk_sizes(self):
+        windows = _plan_muq_windows(30.0, 8.0, overlap_seconds=10.0)
+        assert windows[0] == (0.0, 8.0, 0.0)
+        assert windows[1][0] == pytest.approx(6.0)
+        assert windows[1][2] == pytest.approx(2.0)

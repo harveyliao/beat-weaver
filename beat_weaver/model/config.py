@@ -64,6 +64,14 @@ class ModelConfig:
     use_conformer: bool = True  # Conformer blocks instead of Transformer encoder
     conformer_kernel_size: int = 31  # Depthwise conv kernel size
 
+    # Audio duration filter (seconds, 0 = no limit)
+    max_audio_duration: float = 0.0
+
+    # Encoder type: "conformer", "transformer", or "muq"
+    encoder_type: str = "conformer"  # "muq" = frozen pretrained MuQ encoder
+    muq_model_name: str = "OpenMuQ/MuQ-large-msd-iter"  # HuggingFace model ID
+    freeze_encoder: bool = True  # Freeze MuQ weights (always True for Option A)
+
     # Auxiliary losses
     density_loss_weight: float = 0.1
     color_balance_weight: float = 0.0  # Weight for color balance auxiliary loss
