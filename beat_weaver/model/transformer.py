@@ -366,6 +366,40 @@ class RoPEDecoderLayer(nn.Module):
 # ── Main modules ──────────────────────────────────────────────────────────────
 
 
+class MuQAdapter(nn.Module):
+    """Project pre-cached MuQ features (1024-D) to decoder dimension.
+
+    Replaces AudioEncoder when using frozen MuQ features.
+    Input shape matches mel convention: (batch, 1024, T_audio).
+    """
+
+    MUQ_DIM = 1024
+
+    def __init__(self, config: ModelConfig):
+        super().__init__()
+        self.proj = nn.Linear(self.MUQ_DIM, config.decoder_dim)
+        self.norm = nn.LayerNorm(config.decoder_dim)
+        self.dropout = nn.Dropout(config.dropout)
+
+    def forward(
+        self, mel: torch.Tensor, mel_mask: torch.Tensor | None = None,
+    ) -> torch.Tensor:
+        """Project MuQ features to decoder dimension.
+
+        Args:
+            mel: (batch, 1024, T_audio) — pre-cached MuQ features
+            mel_mask: (batch, T_audio) — True for valid positions (unused but kept for API compat)
+
+        Returns:
+            (batch, T_audio, decoder_dim)
+        """
+        x = mel.transpose(1, 2)  # (batch, T_audio, 1024)
+        x = self.proj(x)         # (batch, T_audio, decoder_dim)
+        x = self.norm(x)
+        x = self.dropout(x)
+        return x
+
+
 class AudioEncoder(nn.Module):
     """Encode mel spectrogram into contextualized audio representations."""
 
@@ -562,7 +596,10 @@ class BeatWeaverModel(nn.Module):
     def __init__(self, config: ModelConfig):
         super().__init__()
         self.config = config
-        self.encoder = AudioEncoder(config)
+        if config.encoder_type == "muq":
+            self.encoder = MuQAdapter(config)
+        else:
+            self.encoder = AudioEncoder(config)
         self.decoder = TokenDecoder(config)
 
     def forward(
