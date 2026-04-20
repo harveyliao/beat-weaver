@@ -74,8 +74,7 @@ See [plans/009-muq-frame-alignment-experiments.md](plans/009-muq-frame-alignment
 
 ## Prepare Data Here, Train In `muq-beat-weaver`
 
-If you want other people to reproduce the full pipeline, use this repo as the corpus builder and
-use the sibling repo `../muq-beat-weaver` for MuQ-first training and inference.
+To reproduce the full pipeline, use this repo as the corpus builder and use the sibling repo `../muq-beat-weaver` for MuQ-first training and inference.
 
 Expected layout:
 
